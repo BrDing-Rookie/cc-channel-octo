@@ -400,6 +400,9 @@ describe('queryAgent', () => {
     expect(sandboxDir.startsWith('/tmp/cwdbase/')).toBe(true);
     // global first, per-bot second (later wins on name collision)
     expect(sources).toEqual(['/base/skills', '/base/default/skills']);
+    const systemPrompt = mockQuery.mock.calls[0][0].options.systemPrompt;
+    expect(systemPrompt.append).toContain('/base/default/skills/<skill-name>/SKILL.md');
+    expect(systemPrompt.append).toContain('shared all-bot skill library is /base/skills');
   });
 
   it('does NOT symlink skills when settingSources excludes project', async () => {
