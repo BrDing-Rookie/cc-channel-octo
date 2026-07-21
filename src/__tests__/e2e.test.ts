@@ -224,6 +224,22 @@ describe('E2E smoke tests', () => {
     expect(history).toContain('[assistant bot-001]: Hello from Claude');
   });
 
+  it('exposes Skill install paths only in the owner DM', async () => {
+    router = new SessionRouter(config, BOT_ID, USER_UID);
+    await simulateMessage(makeDmMsg('install a skill'), config, store, router, groupContext, streamRelay);
+
+    const opts = (queryAgent as ReturnType<typeof vi.fn>).mock.calls[0][4];
+    expect(opts.exposeSkillInstallPaths).toBe(true);
+  });
+
+  it('does not expose Skill install paths in a non-owner DM', async () => {
+    router = new SessionRouter(config, BOT_ID, 'different-owner');
+    await simulateMessage(makeDmMsg('install a skill'), config, store, router, groupContext, streamRelay);
+
+    const opts = (queryAgent as ReturnType<typeof vi.fn>).mock.calls[0][4];
+    expect(opts.exposeSkillInstallPaths).toBeUndefined();
+  });
+
   // --- 1b. v0.3 slash commands through the real pipeline ---
 
   it('/reset clears history, replies, and does NOT call the agent', async () => {
