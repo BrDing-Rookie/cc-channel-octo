@@ -122,7 +122,7 @@ describe('buildSystemPrompt', () => {
     expect(result).toContain('SKILL INSTALLATION:');
     expect(result).toContain('/base/default/skills/<skill-name>/SKILL.md');
     expect(result).toContain('shared all-bot skill library is /base/skills');
-    expect(result).toContain('operator/owner explicitly requests it');
+    expect(result).toContain("only in the bot owner's direct-message session");
   });
 
   it('omits skill installation guidance when no per-bot directory is configured', () => {

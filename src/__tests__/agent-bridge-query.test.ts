@@ -393,7 +393,9 @@ describe('queryAgent', () => {
       globalSkillsDir: '/base/skills',
       sdk: { allowedTools: '*', permissionMode: 'bypassPermissions', settingSources: ['project'] },
     });
-    for await (const _ of queryAgent('t', config, { kind: 'dm', sessionKey: 'u1' })) { void _; }
+    for await (const _ of queryAgent('t', config, { kind: 'dm', sessionKey: 'u1' }, undefined, {
+      exposeSkillInstallPaths: true,
+    })) { void _; }
     expect(linkSkillsIntoSandbox).toHaveBeenCalledTimes(1);
     const [sandboxDir, sources] = vi.mocked(linkSkillsIntoSandbox).mock.calls[0];
     // sandbox is the resolved per-session cwd under cwdBase
@@ -403,6 +405,20 @@ describe('queryAgent', () => {
     const systemPrompt = mockQuery.mock.calls[0][0].options.systemPrompt;
     expect(systemPrompt.append).toContain('/base/default/skills/<skill-name>/SKILL.md');
     expect(systemPrompt.append).toContain('shared all-bot skill library is /base/skills');
+  });
+
+  it('does not expose persistent skill paths unless the caller authorizes it', async () => {
+    mockQuery.mockReturnValue(createMockStream([
+      { type: 'assistant', session_id: 's-1', message: { content: [{ type: 'text', text: 'hi' }] } },
+    ]));
+    const config = makeConfig({
+      skillsDir: '/base/default/skills',
+      globalSkillsDir: '/base/skills',
+    });
+    for await (const _ of queryAgent('t', config, { kind: 'dm', sessionKey: 'u1' })) { void _; }
+    const systemPrompt = mockQuery.mock.calls[0][0].options.systemPrompt;
+    expect(systemPrompt.append).not.toContain('SKILL INSTALLATION:');
+    expect(systemPrompt.append).not.toContain('/base/default/skills');
   });
 
   it('does NOT symlink skills when settingSources excludes project', async () => {

@@ -842,7 +842,7 @@ export async function handleMessage(
       // queryAgent recovers by calling onResumeFailed (clear the bad id) and
       // retrying once with the pre-assembled fallbackRetryPrompt so the
       // conversation isn't lost (and assembly happens exactly once — see above).
-      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string } | undefined = {
+      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean } | undefined = {
         ...(resume ? { resume } : {}),
         onSessionId: (id: string) => store.setSdkSessionId(sessionKey, id),
         ...(resume
@@ -852,6 +852,13 @@ export async function handleMessage(
             }
           : {}),
       };
+
+      // Persistent Skill paths are disclosed only to the registered owner in a
+      // DM. Group sessions are shared, so exposing them there would persist the
+      // privileged guidance into a session later resumed by non-owner members.
+      if (!isGroup && msg.from_uid !== '' && msg.from_uid === router.getOwnerUid()) {
+        sessionOpts = { ...(sessionOpts ?? {}), exposeSkillInstallPaths: true };
+      }
 
       // v1.1: point the SDK auto-memory at a stable per-session dir under
       // memoryBase (<baseDir>/<botId>/memory, outside cwdBase so it's never
