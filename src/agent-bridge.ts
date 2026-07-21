@@ -256,7 +256,7 @@ export async function* queryAgent(
   const systemPrompt = buildSystemPrompt(
     config.sdk.systemPrompt,
     opts?.groupInstructions,
-    opts?.exposeSkillInstallPaths
+    opts?.exposeSkillInstallPaths && settingSources.includes('project')
       ? { perBot: config.skillsDir, global: config.globalSkillsDir }
       : undefined,
   );
