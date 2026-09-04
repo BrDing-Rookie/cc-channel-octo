@@ -9,10 +9,17 @@
 import {
   ChannelType,
   MessageType,
+  CARD_PROFILE,
+  CARD_INTERACTIVE_PROFILE,
+  CARD_VERSION,
+  type CardProfile,
   type MentionEntity,
   type SendMessageResult,
   type Thread,
   type ThreadMember,
+  type TargetCandidate,
+  type BotEvent,
+  type CardCaps,
 } from "./types.js";
 import { randomUUID } from "node:crypto";
 
@@ -853,4 +860,1387 @@ export async function updateThreadMd(params: {
   const text = await resp.text();
   if (!text) return { version: 0 };
   return parseOctoJson<{ version: number }>(text);
+}
+
+// ─── Interactive Card (type 17) ──────────────────────────────────────────────
+//
+// Wire-layer restore of the card senders removed at fork time. Path / method /
+// auth / payload shape mirror openclaw-channel-octo api-fetch.ts (octo-server
+// PR #525 P1 / #548). Cards ride on `/v1/bot/sendMessage` (send) and
+// `/v1/bot/message/edit` (edit) with `payload.type = 17`. cc's postJson has no
+// 429-retry layer, so the `retryOn429` knob openclaw threads through its senders
+// is intentionally dropped here — the wire contract (type17 / profile upgrade /
+// card_seq CAS / transient) lives entirely in payload assembly and is preserved.
+
+/** True when a card tree contains any interactive node (Input.* / Action.Submit). */
+function cardContainsInteraction(value: unknown, seen = new WeakSet<object>()): boolean {
+  if (!value || typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((item) => cardContainsInteraction(item, seen));
+  const record = value as Record<string, unknown>;
+  if (typeof record.type === "string" && (
+    record.type.startsWith("Input.") || record.type === "Action.Submit"
+  )) return true;
+  return Object.values(record).some((item) => cardContainsInteraction(item, seen));
+}
+
+/**
+ * Resolve the wire profile for a card. A display card uses the requested profile
+ * (default `octo/v1`); any card carrying interaction is force-upgraded to
+ * `octo/v2` regardless of what the caller asked for.
+ */
+function resolveCardProfile(card: Record<string, unknown>, requested?: CardProfile): CardProfile {
+  return cardContainsInteraction(card) ? CARD_INTERACTIVE_PROFILE : (requested ?? CARD_PROFILE);
+}
+
+function buildCardMention(params: {
+  mentionUids?: string[];
+  mentionEntities?: MentionEntity[];
+  mentionAll?: boolean;
+}): Record<string, unknown> | undefined {
+  if (
+    !(params.mentionUids && params.mentionUids.length > 0) &&
+    !(params.mentionEntities && params.mentionEntities.length > 0) &&
+    !params.mentionAll
+  ) {
+    return undefined;
+  }
+  const mention: Record<string, unknown> = {};
+  if (params.mentionUids && params.mentionUids.length > 0) mention.uids = params.mentionUids;
+  if (params.mentionEntities && params.mentionEntities.length > 0) mention.entities = params.mentionEntities;
+  if (params.mentionAll) mention.all = 1;
+  return mention;
+}
+
+/**
+ * Send an InteractiveCard(=17) message. `card` is standard Adaptive Cards 1.5
+ * JSON (schema validation is server-authoritative in pkg/cardmsg — this function
+ * only assembles the envelope). `card_version` is fixed at `1.5`; the profile is
+ * `octo/v1` unless the card carries `Input.*` / `Action.Submit`, which upgrades
+ * it to `octo/v2`. Callers should feature-detect via getCardProfile first (D12).
+ * `onBehalfOf` is forwarded when set, but OBO + type-17 is rejected server-side
+ * (P1 Decision 2b), so it is only meaningful for regular bot card sends.
+ */
+export async function sendCardMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  card: Record<string, unknown>;
+  /** Display cards default to octo/v1; Input.* / Action.Submit auto-upgrade to octo/v2. */
+  profile?: CardProfile;
+  plain?: string;
+  mentionUids?: string[];
+  mentionEntities?: MentionEntity[];
+  mentionAll?: boolean;
+  replyMsgId?: string;
+  onBehalfOf?: string;
+  clientMsgNo?: string;
+  signal?: AbortSignal;
+}): Promise<SendMessageResult | undefined> {
+  if (!params.channelId || !params.channelId.trim()) {
+    throw new Error("octo: channelId is required to send a message");
+  }
+  const payload: Record<string, unknown> = {
+    type: MessageType.InteractiveCard,
+    card: params.card,
+    profile: resolveCardProfile(params.card, params.profile),
+    card_version: CARD_VERSION,
+  };
+  if (typeof params.plain === "string") payload.plain = params.plain;
+  const mention = buildCardMention(params);
+  if (mention) payload.mention = mention;
+  if (params.replyMsgId) payload.reply = { message_id: params.replyMsgId };
+  return await postJson<SendMessageResult>(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload,
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+    ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
+  }, params.signal);
+}
+
+export interface CardTemplateRef {
+  id: string;
+  version: string;
+}
+
+/** Effective per-bot card policy returned by GET /v1/bot/card/profile. */
+export interface BotCardConfig {
+  card_enabled: boolean;
+  display_enabled: boolean;
+  interaction_enabled: boolean;
+  reasoning_enabled: boolean;
+  reasoning_template_ref: CardTemplateRef | null;
+}
+
+export interface CardTemplateViewCapability {
+  name: string;
+  states: string[];
+  wire_profile: string;
+  submit_actions: string[];
+}
+
+export interface CardTemplateCapability {
+  id: string;
+  version: string;
+  views: CardTemplateViewCapability[];
+}
+
+export interface CardTemplatingCapability {
+  supported: boolean;
+  wire: string;
+  templates: CardTemplateCapability[];
+}
+
+/**
+ * Validate a Registry template frame before it goes on the wire: templateRef must
+ * be exactly { id, version } (both non-empty strings), state a non-empty string,
+ * and data a plain object whose own `state` equals `state`.
+ */
+function validateTemplateFrame(params: {
+  templateRef: CardTemplateRef;
+  state: string;
+  data: object;
+}): void {
+  const templateRef = params.templateRef as unknown;
+  if (templateRef === null || typeof templateRef !== "object" || Array.isArray(templateRef)) {
+    throw new Error("octo: templateRef must contain exactly id and version");
+  }
+  const templateRefKeys = Object.keys(templateRef);
+  if (templateRefKeys.length !== 2 ||
+      !templateRefKeys.includes("id") ||
+      !templateRefKeys.includes("version")) {
+    throw new Error("octo: templateRef must contain exactly id and version");
+  }
+  const { id, version } = templateRef as Record<string, unknown>;
+  if (typeof id !== "string" || typeof version !== "string" || !id.trim() || !version.trim()) {
+    throw new Error("octo: templateRef id/version are required");
+  }
+  if (typeof params.state !== "string" || !params.state.trim()) {
+    throw new Error("octo: template state is required");
+  }
+  const data = params.data as unknown;
+  if (data === null || typeof data !== "object" || Array.isArray(data) ||
+      (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null) ||
+      !Object.hasOwn(data, "state")) {
+    throw new Error("octo: data must be a plain object with own state");
+  }
+  if ((data as { state: unknown }).state !== params.state) {
+    throw new Error("octo: data.state must match state");
+  }
+}
+
+/**
+ * Send one Registry-authored type-17 card (no render-owned card body). OBO is
+ * intentionally absent: Registry template cards are bot-authored, and OBO +
+ * type-17 is rejected server-side (P1 Decision 2b).
+ */
+export async function sendTemplateCardMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  templateRef: CardTemplateRef;
+  state: string;
+  data: object;
+  clientMsgNo?: string;
+  signal?: AbortSignal;
+}): Promise<SendMessageResult | undefined> {
+  if (!params.channelId || !params.channelId.trim()) {
+    throw new Error("octo: channelId is required to send a message");
+  }
+  validateTemplateFrame(params);
+  return await postJson<SendMessageResult>(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload: {
+      type: MessageType.InteractiveCard,
+      template_ref: params.templateRef,
+      state: params.state,
+      data: params.data,
+    },
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+  }, params.signal);
+}
+
+/**
+ * Edit an InteractiveCard(=17) message in place (D6 frame rewrite, PR #548).
+ * `POST /v1/bot/message/edit`; `content_edit` is the complete type-17 envelope
+ * serialized as a JSON string (symmetric with send). Only the bot's own,
+ * un-recalled cards can be edited.
+ *
+ *   - `cardSeq` is the interactive multi-frame monotonic sequence (CAS): the
+ *     server rejects a stale / out-of-order frame. Kept a JS safe integer here;
+ *     positive-safe-integer is enforced before it goes on the wire.
+ *   - `transient` marks a progress mid-frame so it does NOT enter the D10 revision
+ *     history (avoids the cap-20 history being flooded by progress noise); a
+ *     terminal frame omits it and is recorded.
+ */
+export async function editCardMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  messageId: string;
+  channelId: string;
+  channelType: ChannelType;
+  card: Record<string, unknown>;
+  /** Defaults to octo/v1; Input.* / Action.Submit auto-upgrade to octo/v2. */
+  profile?: CardProfile;
+  /** Monotonic frame sequence for interactive multi-frame edits (CAS). */
+  cardSeq?: number;
+  plain?: string;
+  /** Progress mid-frames pass true → excluded from D10 revision history. */
+  transient?: boolean;
+  onBehalfOf?: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  if (!params.messageId) {
+    throw new Error("octo: messageId is required to edit a card");
+  }
+  if (!params.channelId || !params.channelId.trim()) {
+    throw new Error("octo: channelId is required to edit a card");
+  }
+  const envelope: Record<string, unknown> = {
+    type: MessageType.InteractiveCard,
+    card: params.card,
+    profile: resolveCardProfile(params.card, params.profile),
+    card_version: CARD_VERSION,
+  };
+  if (typeof params.plain === "string") envelope.plain = params.plain;
+  if (params.cardSeq !== undefined) {
+    if (!Number.isSafeInteger(params.cardSeq) || params.cardSeq <= 0) {
+      throw new Error("octo: cardSeq must be a positive safe integer");
+    }
+    envelope.card_seq = params.cardSeq;
+  }
+  if (params.transient) envelope.transient = true;
+  await postJson(params.apiUrl, params.botToken, "/v1/bot/message/edit", {
+    message_id: params.messageId,
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    content_edit: JSON.stringify(envelope),
+    ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
+  }, params.signal);
+}
+
+// ─── Card Profile / Capability Negotiation (D12, A1) ─────────────────────────
+
+/**
+ * D12 producer capability-discovery manifest (octo-server PR #525 P2, additive).
+ */
+export interface CardProfileManifest {
+  /**
+   * Whether the D12 manifest endpoint is deployed and answered (non-404). When
+   * false every card capability fails closed — no local toggle / template
+   * fallback is used.
+   */
+  available: boolean;
+  /** Legacy manifest master switch; real sends use the server-ANDed `config` values. */
+  enabled: boolean;
+  /** Supported profile list, e.g. `["octo/v1"]` (P2 adds `"octo/v2"`). */
+  profiles?: string[];
+  card_version?: string;
+  /** Server-advertised element / input whitelist (pkg/cardmsg authoritative, additive). */
+  elements?: string[];
+  inputs?: string[];
+  /**
+   * Local / navigation action whitelist. `Action.Submit` is NOT listed here — it
+   * is signalled by `profiles` containing `octo/v2`. Old deployments omit this
+   * (undefined) → consumers conservatively treat all actions as unsupported.
+   */
+  actions?: string[];
+  /** Size / structure limits (node/depth/body caps, etc.). */
+  limits?: Record<string, unknown>;
+  /** Optional Registry template-ref/v1 capability and explicit Bot catalog. */
+  templating?: CardTemplatingCapability;
+  /** Effective per-bot policy. Each flag already includes the server's global gate. */
+  config?: BotCardConfig;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function parseTemplatingCapability(value: unknown): CardTemplatingCapability | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const root = value as Record<string, unknown>;
+  const templates: CardTemplateCapability[] = [];
+  for (const candidate of Array.isArray(root.templates) ? root.templates : []) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const template = candidate as Record<string, unknown>;
+    if (typeof template.id !== "string" || typeof template.version !== "string") continue;
+    const views: CardTemplateViewCapability[] = [];
+    for (const candidateView of Array.isArray(template.views) ? template.views : []) {
+      if (!candidateView || typeof candidateView !== "object" || Array.isArray(candidateView)) continue;
+      const view = candidateView as Record<string, unknown>;
+      if (typeof view.name !== "string" || typeof view.wire_profile !== "string") continue;
+      views.push({
+        name: view.name,
+        wire_profile: view.wire_profile,
+        states: stringArray(view.states),
+        submit_actions: stringArray(view.submit_actions),
+      });
+    }
+    templates.push({ id: template.id, version: template.version, views });
+  }
+  return {
+    supported: root.supported === true,
+    wire: typeof root.wire === "string" ? root.wire : "",
+    templates,
+  };
+}
+
+function parseCardTemplateRef(value: unknown): CardTemplateRef | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const ref = value as Record<string, unknown>;
+  if (Object.keys(ref).length !== 2 ||
+      typeof ref.id !== "string" || !ref.id || ref.id.trim() !== ref.id ||
+      typeof ref.version !== "string" || !ref.version || ref.version.trim() !== ref.version) {
+    return undefined;
+  }
+  return { id: ref.id, version: ref.version };
+}
+
+function parseBotCardConfig(value: unknown): BotCardConfig | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const config = value as Record<string, unknown>;
+  if (typeof config.card_enabled !== "boolean" ||
+      typeof config.display_enabled !== "boolean" ||
+      typeof config.interaction_enabled !== "boolean" ||
+      typeof config.reasoning_enabled !== "boolean") {
+    return undefined;
+  }
+  if (!config.card_enabled &&
+      (config.display_enabled || config.interaction_enabled || config.reasoning_enabled)) {
+    return undefined;
+  }
+  const reasoningRef = parseCardTemplateRef(config.reasoning_template_ref);
+  // The server guarantees this invariant. Reject a malformed response rather than guessing a
+  // policy locally: a permissive normalization could re-enable a card the Bot owner disabled.
+  if (reasoningRef === undefined ||
+      (config.reasoning_enabled && reasoningRef === null) ||
+      (!config.reasoning_enabled && reasoningRef !== null)) {
+    return undefined;
+  }
+  return {
+    card_enabled: config.card_enabled,
+    display_enabled: config.display_enabled,
+    interaction_enabled: config.interaction_enabled,
+    reasoning_enabled: config.reasoning_enabled,
+    reasoning_template_ref: reasoningRef,
+  };
+}
+
+/**
+ * GET /v1/bot/card/profile — D12 capability discovery. Feature-detect before
+ * sending a card instead of probing with a send (a 400 cannot distinguish
+ * "disabled" from "invalid").
+ *
+ * FAIL-CLOSED: the caller must degrade on every non-success outcome.
+ *   - endpoint not deployed (404) → `{ available: false, enabled: false }`.
+ *   - deployed but body missing / malformed → `{ available: true, enabled: false }`
+ *     (and any malformed `config` / `templating` is simply dropped).
+ * Transport / 5xx throws, leaving the retry cadence to the caller.
+ */
+export async function getCardProfile(params: {
+  apiUrl: string;
+  botToken: string;
+  signal?: AbortSignal;
+}): Promise<CardProfileManifest> {
+  const path = "/v1/bot/card/profile";
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${params.botToken}` },
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  // Endpoint not yet deployed → fail closed; never guess the server's Bot policy locally.
+  if (resp.status === 404) return { available: false, enabled: false };
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  // Endpoint deployed (available:true); a malformed manifest degrades to enabled:false.
+  const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!raw || typeof raw !== "object") return { available: true, enabled: false };
+  const templating = parseTemplatingCapability(raw.templating);
+  const config = parseBotCardConfig(raw.config);
+  return {
+    available: true,
+    // Accept boolean and 1/0 serialization (consistent with GroupMember.robot / getMentionPref).
+    enabled: raw.enabled === true || raw.enabled === 1,
+    ...(Array.isArray(raw.profiles) ? { profiles: stringArray(raw.profiles) } : {}),
+    ...(typeof raw.card_version === "string" ? { card_version: raw.card_version } : {}),
+    ...(Array.isArray(raw.elements) ? { elements: stringArray(raw.elements) } : {}),
+    ...(Array.isArray(raw.inputs) ? { inputs: stringArray(raw.inputs) } : {}),
+    ...(Array.isArray(raw.actions) ? { actions: stringArray(raw.actions) } : {}),
+    ...(raw.limits && typeof raw.limits === "object" ? { limits: raw.limits as Record<string, unknown> } : {}),
+    ...(templating ? { templating } : {}),
+    ...(config ? { config } : {}),
+  };
+}
+
+const ACTION_SUBMIT = "Action.Submit";
+
+function positiveFiniteLimit(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  const integer = Math.floor(value);
+  return integer > 0 ? integer : undefined;
+}
+
+/** Convert the server manifest into one authoritative set of renderer capabilities. */
+export function deriveCardCaps(manifest: CardProfileManifest): CardCaps {
+  const limits = manifest.limits;
+  const maxNodes = positiveFiniteLimit(limits?.max_nodes);
+  const maxDepth = positiveFiniteLimit(limits?.max_depth);
+  const maxPayloadBytes = positiveFiniteLimit(limits?.max_payload_bytes);
+  const maxInputTextBytes = positiveFiniteLimit(limits?.max_input_text_bytes);
+  const maxInputsBytes = positiveFiniteLimit(limits?.max_inputs_bytes);
+
+  return {
+    ...(Array.isArray(manifest.elements) ? { elements: new Set(manifest.elements) } : {}),
+    ...(Array.isArray(manifest.inputs) ? { inputs: new Set(manifest.inputs) } : {}),
+    ...(Array.isArray(manifest.actions) ? { actions: new Set(manifest.actions) } : {}),
+    ...(maxNodes !== undefined ? { maxNodes } : {}),
+    ...(maxDepth !== undefined ? { maxDepth } : {}),
+    ...(maxPayloadBytes !== undefined ? { maxPayloadBytes } : {}),
+    ...(maxInputTextBytes !== undefined ? { maxInputTextBytes } : {}),
+    ...(maxInputsBytes !== undefined ? { maxInputsBytes } : {}),
+  };
+}
+
+/**
+ * D12 reserves `actions` for local/navigation actions. Submit-callback support is
+ * advertised by the `octo/v2` profile itself, so translate that profile into the
+ * builder's semantic capability rather than trusting a stray `Action.Submit` in
+ * the actions list.
+ */
+export function deriveInteractiveCardCaps(manifest: CardProfileManifest): CardCaps {
+  const caps = deriveCardCaps(manifest);
+  const actions = new Set(caps.actions ?? []);
+  actions.delete(ACTION_SUBMIT);
+  if (manifest.profiles?.includes(CARD_INTERACTIVE_PROFILE)) actions.add(ACTION_SUBMIT);
+  return { ...caps, actions };
+}
+
+// ─── Bot Events (card-action callback queue, A5) ─────────────────────────────
+
+/** Bound on an *idle* /v1/bot/events request (short poll or ack). */
+const EVENTS_POLL_TIMEOUT_MS = 10_000;
+/** Slack added on top of a long-poll hold before the client gives up. */
+const EVENTS_POLL_WAIT_MARGIN_MS = 10_000;
+/** Mirrors the server-side clamp on `wait`. Single source of truth. */
+export const MAX_EVENT_WAIT_SECONDS = 30;
+/** Smallest useful hold; a non-zero value under this is raised to it rather than rejected. */
+export const MIN_EVENT_WAIT_SECONDS = 5;
+
+/**
+ * Client timeout for one /v1/bot/events request. Must exceed the requested hold,
+ * otherwise the client aborts mid-hold and the poll loop degrades into a
+ * timeout/retry storm strictly worse than plain short polling.
+ */
+export function eventsPollTimeoutMs(waitSeconds?: number): number {
+  if (!waitSeconds || waitSeconds <= 0) return EVENTS_POLL_TIMEOUT_MS;
+  return waitSeconds * 1000 + EVENTS_POLL_WAIT_MARGIN_MS;
+}
+
+/**
+ * Pull typed bot events strictly after the supplied cursor.
+ *
+ * With `waitSeconds` unset or 0 this is a plain short poll. With `waitSeconds > 0`
+ * the server holds an empty queue open for that long and answers as soon as an
+ * event lands (opt-in on the wire, so a client that does not raise its own
+ * timeout keeps working unchanged). An expired hold is a normal empty batch.
+ */
+export async function fetchBotEvents(params: {
+  apiUrl: string;
+  botToken: string;
+  sinceEventId?: number;
+  limit?: number;
+  waitSeconds?: number;
+  signal?: AbortSignal;
+}): Promise<BotEvent[]> {
+  const waitSeconds =
+    params.waitSeconds && params.waitSeconds > 0
+      ? Math.min(MAX_EVENT_WAIT_SECONDS, Math.floor(params.waitSeconds))
+      : 0;
+  const response = await postJson<{ results?: BotEvent[] }>(
+    params.apiUrl,
+    params.botToken,
+    "/v1/bot/events",
+    {
+      event_id: params.sinceEventId ?? 0,
+      limit: Math.max(1, Math.min(100, Math.floor(params.limit ?? 20))),
+      // Omitted entirely when not long-polling, so the request stays byte-identical to what
+      // servers that predate the `wait` field already accept.
+      ...(waitSeconds > 0 ? { wait: waitSeconds } : {}),
+    },
+    params.signal ?? AbortSignal.timeout(eventsPollTimeoutMs(waitSeconds)),
+  );
+  return Array.isArray(response?.results) ? response.results : [];
+}
+
+/** Best-effort queue pruning after a recognized bot event has been accepted locally. */
+export async function ackBotEvent(params: {
+  apiUrl: string;
+  botToken: string;
+  eventId: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  await postJson(
+    params.apiUrl,
+    params.botToken,
+    `/v1/bot/events/${params.eventId}/ack`,
+    {},
+    params.signal ?? AbortSignal.timeout(EVENTS_POLL_TIMEOUT_MS),
+  );
+}
+
+// ─── Mention Preference (per-group @-免 gate) ────────────────────────────────
+
+/** Short timeout for the per-message mention_pref hot-path lookup. */
+const MENTION_PREF_TIMEOUT_MS = 3_000;
+
+/**
+ * Per-group mention preference (octo-server #237 / YUJ-2996). Two permission axes
+ * AND together:
+ *  - `no_mention`: the bot owner's intent (no record = false).
+ *  - `group_allow_no_mention`: the group-level master switch (no record = true).
+ *  - `effective = no_mention && group_allow_no_mention`: whether a mention-free
+ *    message may trigger a reply. The gate reads only `effective`.
+ */
+export interface MentionPref {
+  no_mention: boolean;
+  group_allow_no_mention: boolean;
+  effective: boolean;
+}
+
+/**
+ * Fetch a group's mention preference for the current bot. Never throws: any
+ * failure (network / non-2xx / parse) falls back to account-level behavior
+ * (`effective=false`, i.e. mention still required) so the gate cannot crash.
+ * Old servers that return only `{ no_mention }` degrade to `effective=no_mention`.
+ */
+export async function getMentionPref(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;
+  signal?: AbortSignal;
+}): Promise<MentionPref> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups/${encodeURIComponent(params.groupNo)}/mention_pref`;
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${params.botToken}` },
+      signal: params.signal ?? AbortSignal.timeout(MENTION_PREF_TIMEOUT_MS),
+    });
+    if (!resp.ok) {
+      // 404 (endpoint not deployed yet) / 401 (empty token) are benign and recur on every
+      // inbound message — do not spam error logs for the expected rollout statuses.
+      if (resp.status !== 404 && resp.status !== 401) {
+        console.error(`octo: getMentionPref(${params.groupNo}) failed: ${resp.status}`);
+      }
+      return { no_mention: false, group_allow_no_mention: true, effective: false };
+    }
+    const data = await resp.json() as Record<string, unknown>;
+    // Accept boolean `true` or numeric `1` (DB/JSON may serialize either).
+    const noMention = data?.no_mention === true || data?.no_mention === 1;
+    const groupAllow = data?.group_allow_no_mention === undefined
+      ? true
+      : data.group_allow_no_mention === true || data.group_allow_no_mention === 1;
+    const effective = data?.effective === undefined
+      ? noMention && groupAllow
+      : data.effective === true || data.effective === 1;
+    return { no_mention: noMention, group_allow_no_mention: groupAllow, effective };
+  } catch (err) {
+    console.error(`octo: getMentionPref(${params.groupNo}) error: ${String(err)}`);
+    return { no_mention: false, group_allow_no_mention: true, effective: false };
+  }
+}
+
+// ─── OBO Grant (persona-clone introspection) ─────────────────────────────────
+
+/**
+ * The bot's view of its own OBO grant (GET /v1/bot/obo-grant, octo-server
+ * YUJ-1762). A persona clone reads the active `persona_prompt` from here; a
+ * regular bot has no grant.
+ */
+export interface BotOboGrant {
+  /** False / absent when the bot has no active grant (regular non-persona bot). */
+  has_grant: boolean;
+  grantor_uid?: string;
+  grantor_name?: string;
+  persona_prompt?: string;
+  /** Whether the grant is currently active (mode != "paused" & not revoked). */
+  active?: boolean;
+}
+
+/**
+ * GET /v1/bot/obo-grant — fetch this bot's own OBO grant info.
+ *
+ * Returns null when the bot has no grant (404), the server reports
+ * has_grant=false, or the response is malformed. Throws on transport / 5xx so
+ * the caller's retry-on-next-tick cadence can decide whether to log and skip.
+ */
+export async function getBotOboGrant(params: {
+  apiUrl: string;
+  botToken: string;
+  signal?: AbortSignal;
+}): Promise<BotOboGrant | null> {
+  const path = "/v1/bot/obo-grant";
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${params.botToken}` },
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  // 404 = no grant for this bot (regular bot, not a persona clone).
+  if (resp.status === 404) return null;
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!raw || typeof raw !== "object") return null;
+  // Accept when `has_grant: true` is explicit, OR when the field is absent and a
+  // non-empty `grantor_uid` is present (some server versions omit has_grant). An
+  // explicit `has_grant: false` is authoritative denial and fails closed.
+  const hasGrant = raw.has_grant === true ||
+    (raw.has_grant === undefined &&
+      typeof raw.grantor_uid === "string" &&
+      raw.grantor_uid.length > 0);
+  if (!hasGrant) return null;
+  return {
+    has_grant: true,
+    grantor_uid: typeof raw.grantor_uid === "string" ? raw.grantor_uid : undefined,
+    grantor_name: typeof raw.grantor_name === "string" ? raw.grantor_name : undefined,
+    persona_prompt: typeof raw.persona_prompt === "string" ? raw.persona_prompt : undefined,
+    active: raw.active === true,
+  };
+}
+
+// ─── Presigned Upload (backend-agnostic file upload) ─────────────────────────
+
+/**
+ * Get a presigned PUT URL for direct, backend-agnostic file upload
+ * (GET /v1/bot/upload/presigned). Signs a PUT URL against whatever object
+ * storage the deployment uses (MinIO / COS / S3 / OSS).
+ *
+ * `fileSize` is REQUIRED and must be the exact byte count of the body about to
+ * be PUT: on SigV4 backends it is signed into the canonical headers as
+ * Content-Length, so any mismatch returns 403 SignatureDoesNotMatch.
+ */
+export async function getUploadPresign(params: {
+  apiUrl: string;
+  botToken: string;
+  filename: string;
+  fileSize: number;
+  contentType?: string;
+  signal?: AbortSignal;
+}): Promise<{
+  uploadUrl: string;
+  downloadUrl: string;
+  contentType: string;
+  contentDisposition?: string;
+}> {
+  if (!Number.isInteger(params.fileSize) || params.fileSize <= 0) {
+    throw new Error(`getUploadPresign requires a positive integer fileSize (got ${params.fileSize})`);
+  }
+  const query = new URLSearchParams({
+    filename: params.filename,
+    fileSize: String(params.fileSize),
+  });
+  if (params.contentType) query.set("contentType", params.contentType);
+  const path = "/v1/bot/upload/presigned";
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}?${query}`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${params.botToken}` },
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${response.status}): ${text || response.statusText}`);
+  }
+  const data = await response.json() as Record<string, unknown>;
+  if (typeof data.uploadUrl !== "string" || typeof data.downloadUrl !== "string") {
+    const missing = ["uploadUrl", "downloadUrl"].filter((k) => typeof data[k] !== "string");
+    throw new Error(`Octo API ${path} returned incomplete response: missing ${missing.join(", ")}`);
+  }
+  return {
+    uploadUrl: data.uploadUrl,
+    downloadUrl: data.downloadUrl,
+    contentType: typeof data.contentType === "string" ? data.contentType : "application/octet-stream",
+    contentDisposition: typeof data.contentDisposition === "string" ? data.contentDisposition : undefined,
+  };
+}
+
+/**
+ * Upload a file body with a single PUT to a server-issued presigned URL. The
+ * body must be exactly `fileSize` bytes (the same value passed to
+ * {@link getUploadPresign} so the signed Content-Length matches). `contentType`
+ * and `contentDisposition` are replayed verbatim from the presign response —
+ * both are folded into the canonical headers on MinIO/COS, so omitting or
+ * altering them returns 403 SignatureDoesNotMatch.
+ *
+ * Returns `{ url }` = the presign response's `downloadUrl`.
+ */
+export async function uploadFileToPresignedUrl(params: {
+  uploadUrl: string;
+  downloadUrl: string;
+  fileBody: Buffer | NodeJS.ReadableStream;
+  fileSize: number;
+  contentType: string;
+  contentDisposition?: string;
+  signal?: AbortSignal;
+}): Promise<{ url: string }> {
+  const headers: Record<string, string> = {
+    "Content-Type": params.contentType,
+    "Content-Length": String(params.fileSize),
+  };
+  if (params.contentDisposition) {
+    headers["Content-Disposition"] = params.contentDisposition;
+  }
+  // `duplex: "half"` is required by undici when streaming a request body but is
+  // not yet in the RequestInit typings; intersect it in rather than casting to any.
+  const init: RequestInit & { duplex: "half" } = {
+    method: "PUT",
+    headers,
+    body: params.fileBody as unknown as RequestInit["body"],
+    duplex: "half",
+    signal: params.signal,
+  };
+  const response = await fetch(params.uploadUrl, init);
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Presigned PUT upload failed (${response.status}): ${text || response.statusText}`);
+  }
+  return { url: params.downloadUrl };
+}
+
+// ─── Target Resolve (name → channel candidates) ──────────────────────────────
+
+/**
+ * Resolve a NAMED target ("forward to 'XXX'") into concrete channel candidates
+ * (GET /v1/bot/resolve/targets, octo-server PR #337). Returns candidates the
+ * caller must disambiguate against — it must NEVER hand-build a `group:` address
+ * from a name. An empty result (App Bot, or no match) is candidates:[] / total:0
+ * with HTTP 200, not an error. The response is snake_case and mapped explicitly
+ * into the camelCase TargetCandidate shape so a backend field rename surfaces as
+ * a typed gap here rather than propagating silently.
+ */
+export async function resolveTargetsByName(params: {
+  apiUrl: string;
+  botToken: string;
+  name: string;
+  kind?: "group" | "thread" | "all";
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<{ candidates: TargetCandidate[]; total: number; truncated: boolean }> {
+  const query = new URLSearchParams();
+  query.set("name", params.name);
+  if (params.kind) query.set("kind", params.kind);
+  if (params.limit != null) query.set("limit", String(params.limit));
+  const path = "/v1/bot/resolve/targets";
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}?${query}`;
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${params.botToken}` },
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  const data = (await resp.json()) as {
+    candidates?: Array<Record<string, unknown>>;
+    total?: number;
+    truncated?: boolean;
+  };
+  const rawCandidates = Array.isArray(data?.candidates) ? data.candidates : [];
+  const candidates: TargetCandidate[] = rawCandidates.map((c) => {
+    const mapped: TargetCandidate = {
+      kind: c.kind as "group" | "thread",
+      channelId: c.channel_id as string,
+      channelType: c.channel_type as ChannelType,
+      name: c.name as string,
+      groupNo: c.group_no as string,
+    };
+    if (c.short_id != null) mapped.shortId = c.short_id as string;
+    if (c.parent_name != null) mapped.parentName = c.parent_name as string;
+    return mapped;
+  });
+  // When the server omits `total`, fall back to candidates.length — but that fallback is
+  // unsafe if we asked for a bounded page (limit) and got a full page back: total would
+  // collapse to the page size and a truncated result could masquerade as genuinely unique.
+  // Fail closed: if total is missing AND we hit the limit, force truncated=true.
+  const hasTotal = typeof data?.total === "number";
+  const total = hasTotal ? (data.total as number) : candidates.length;
+  const limitReached =
+    typeof params.limit === "number" && params.limit > 0 && candidates.length >= params.limit;
+  const truncated = data?.truncated === true || (!hasTotal && limitReached);
+  return { candidates, total, truncated };
+}
+
+// ─── Bot Group Management ─────────────────────────────────────────────────────
+
+export async function createGroup(params: {
+  apiUrl: string;
+  botToken: string;
+  name?: string;
+  members: string[];
+  creator: string;
+  spaceId?: string;
+  signal?: AbortSignal;
+}): Promise<{ group_no: string; name: string }> {
+  const path = "/v1/bot/createGroup";
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { ...DEFAULT_HEADERS, Authorization: `Bearer ${params.botToken}` },
+    body: JSON.stringify({
+      name: params.name,
+      members: params.members,
+      creator: params.creator,
+      ...(params.spaceId ? { space_id: params.spaceId } : {}),
+    }),
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  return (await resp.json()) as { group_no: string; name: string };
+}
+
+export async function updateGroup(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;
+  name?: string;
+  notice?: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const body: Record<string, string> = {};
+  if (params.name != null) body.name = params.name;
+  if (params.notice != null) body.notice = params.notice;
+  const path = `/v1/bot/groups/${encodeURIComponent(params.groupNo)}/info`;
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}`;
+  const resp = await fetch(url, {
+    method: "PUT",
+    headers: { ...DEFAULT_HEADERS, Authorization: `Bearer ${params.botToken}` },
+    body: JSON.stringify(body),
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+}
+
+export async function addGroupMembers(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;
+  members: string[];
+  signal?: AbortSignal;
+}): Promise<{ ok: boolean; added: number }> {
+  const path = `/v1/bot/groups/${encodeURIComponent(params.groupNo)}/members/add`;
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { ...DEFAULT_HEADERS, Authorization: `Bearer ${params.botToken}` },
+    body: JSON.stringify({ members: params.members }),
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  return (await resp.json()) as { ok: boolean; added: number };
+}
+
+export async function removeGroupMembers(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;
+  members: string[];
+  signal?: AbortSignal;
+}): Promise<{ ok: boolean; removed: number }> {
+  const path = `/v1/bot/groups/${encodeURIComponent(params.groupNo)}/members/remove`;
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { ...DEFAULT_HEADERS, Authorization: `Bearer ${params.botToken}` },
+    body: JSON.stringify({ members: params.members }),
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  return (await resp.json()) as { ok: boolean; removed: number };
+}
+
+// ─── Bot Groups List / Group Info ─────────────────────────────────────────────
+
+/**
+ * Fetch the groups the bot belongs to (GET /v1/bot/groups). Best-effort: returns
+ * `[]` on any non-2xx or transport error so callers can degrade.
+ */
+export async function fetchBotGroups(params: {
+  apiUrl: string;
+  botToken: string;
+  signal?: AbortSignal;
+}): Promise<Array<{ group_no: string; name: string }>> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups`;
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${params.botToken}` },
+      signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+    });
+    if (!resp.ok) {
+      console.error(`octo: fetchBotGroups failed: ${resp.status}`);
+      return [];
+    }
+    const data = await resp.json();
+    return Array.isArray(data) ? data as Array<{ group_no: string; name: string }> : [];
+  } catch (err) {
+    console.error(`octo: fetchBotGroups error: ${String(err)}`);
+    return [];
+  }
+}
+
+/** Fetch a group's info (GET /v1/bot/groups/{groupNo}). Throws on non-2xx. */
+export async function getGroupInfo(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;
+  signal?: AbortSignal;
+}): Promise<{ group_no: string; name: string; [key: string]: unknown }> {
+  return await getJson<{ group_no: string; name: string; [key: string]: unknown }>(
+    params.apiUrl,
+    params.botToken,
+    `/v1/bot/groups/${encodeURIComponent(params.groupNo)}`,
+    params.signal,
+  );
+}
+
+// ─── Space Members ────────────────────────────────────────────────────────────
+
+export async function searchSpaceMembers(params: {
+  apiUrl: string;
+  botToken: string;
+  keyword?: string;
+  spaceId?: string;
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<Array<{ uid: string; name: string; robot: number }>> {
+  const query = new URLSearchParams();
+  if (params.keyword) query.set("keyword", params.keyword);
+  if (params.spaceId) query.set("space_id", params.spaceId);
+  if (params.limit) query.set("limit", String(params.limit));
+  const path = "/v1/bot/space/members";
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}?${query}`;
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${params.botToken}` },
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  return (await resp.json()) as Array<{ uid: string; name: string; robot: number }>;
+}
+
+// ─── Voice Context CRUD (owner's personal voice-correction context) ───────────
+
+/**
+ * Generic helper for bot JSON API requests (GET / PUT / DELETE). Centralizes URL
+ * construction, auth headers, timeout, and error handling; a body implies a JSON
+ * Content-Type. GET returns the parsed JSON, PUT/DELETE resolve to void.
+ */
+async function botFetchJson<T = void>(params: {
+  apiUrl: string;
+  botToken: string;
+  path: string;
+  method: "GET" | "PUT" | "DELETE";
+  body?: Record<string, unknown>;
+  signal?: AbortSignal;
+}): Promise<T> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${params.path}`;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${params.botToken}`,
+  };
+  if (params.body) {
+    Object.assign(headers, DEFAULT_HEADERS);
+  }
+  const resp = await fetch(url, {
+    method: params.method,
+    headers,
+    body: params.body ? JSON.stringify(params.body) : undefined,
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Octo API ${params.method} ${params.path} failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  if (params.method === "GET") {
+    return (await resp.json()) as T;
+  }
+  return undefined as T;
+}
+
+/**
+ * Query the owner's personal voice-correction context (GET /v1/bot/voice/context).
+ * Normalizes defensively: has_context defaults to false, context / updated_at to
+ * empty string if the backend omits them.
+ */
+export async function getVoiceContext(params: {
+  apiUrl: string;
+  botToken: string;
+  signal?: AbortSignal;
+}): Promise<{ has_context: boolean; context: string; updated_at: string }> {
+  const raw = await botFetchJson<Record<string, unknown>>({
+    apiUrl: params.apiUrl,
+    botToken: params.botToken,
+    path: "/v1/bot/voice/context",
+    method: "GET",
+    signal: params.signal,
+  });
+  return {
+    has_context: raw.has_context === true,
+    context: typeof raw.context === "string" ? raw.context : "",
+    updated_at: typeof raw.updated_at === "string" ? raw.updated_at : "",
+  };
+}
+
+/**
+ * Set the owner's personal voice-correction context (PUT upsert). Content must
+ * not be empty — that is enforced by callers and by the backend (400 on empty).
+ */
+export async function updateVoiceContext(params: {
+  apiUrl: string;
+  botToken: string;
+  content: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  await botFetchJson({
+    apiUrl: params.apiUrl,
+    botToken: params.botToken,
+    path: "/v1/bot/voice/context",
+    method: "PUT",
+    body: { context: params.content },
+    signal: params.signal,
+  });
+}
+
+/** Delete the owner's personal voice-correction context (idempotent; DELETE). */
+export async function deleteVoiceContext(params: {
+  apiUrl: string;
+  botToken: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  await botFetchJson({
+    apiUrl: params.apiUrl,
+    botToken: params.botToken,
+    path: "/v1/bot/voice/context",
+    method: "DELETE",
+    signal: params.signal,
+  });
+}
+
+// ─── Secret Resolve (user-managed external keys) ──────────────────────────────
+
+/**
+ * One candidate when an alias matches more than one stored secret.
+ *
+ * 🔴 SECURITY: candidates carry ONLY non-sensitive identifiers (display_name +
+ * secret_id). The plaintext secret value is NEVER part of a candidate.
+ */
+export interface SecretCandidate {
+  /** Stable opaque id of the secret (safe to echo back for re-resolution). */
+  secret_id?: string;
+  /** Human-facing label the owner gave the secret. Safe to show. */
+  display_name: string;
+}
+
+/**
+ * Result of resolving a secret alias for the bot's owner. Discriminated on
+ * `status`:
+ *  - `resolved`     → exactly one EXACT match; `value` holds the plaintext.
+ *  - `not_found`    → no secret matches the alias (also covers "endpoint not
+ *                     deployed yet during rollout").
+ *  - `ambiguous`    → needs confirmation; `candidates` lists labels only.
+ *  - `rate_limited` → the per-IP resolve limiter rejected this call (HTTP 429).
+ *
+ * 🔴 RED LINE: the `value` field on the `resolved` variant is the ONLY place
+ * plaintext appears. Callers must consume it internally and MUST NOT propagate it
+ * into any LLM-visible return value, transcript, message, or log.
+ */
+export type ResolveSecretResult =
+  | { status: "resolved"; value: string; secret_id?: string; display_name?: string }
+  | { status: "not_found" }
+  | { status: "ambiguous"; candidates: SecretCandidate[] }
+  | { status: "rate_limited" };
+
+/**
+ * Map a raw candidate array into label-only SecretCandidate entries.
+ *
+ * 🔴 SECURITY: deliberately copies ONLY `display_name` + `secret_id` — never any
+ * `value`/`masked`/other server field. Entries with no label are dropped.
+ */
+function parseCandidates(rawCandidates: unknown[]): SecretCandidate[] {
+  return rawCandidates
+    .map((c) => {
+      const obj = (c ?? {}) as Record<string, unknown>;
+      const displayName = typeof obj.display_name === "string" ? obj.display_name : "";
+      const secretId = typeof obj.secret_id === "string" ? obj.secret_id : undefined;
+      return { display_name: displayName, secret_id: secretId };
+    })
+    .filter((c) => c.display_name.length > 0);
+}
+
+/**
+ * Resolve a user-managed external-key alias to its current plaintext value
+ * (POST /v1/bot/secrets/resolve, octo-server YUJ-3538 / PR#301). The wire field
+ * is `query` (accepts a display_name or a secret_id); the server authenticates
+ * the bot and resolves against the secrets owned by that bot's owner.
+ *
+ * HTTP status is authoritative: 200 `{ secret_id?, value }` = resolved; 404 =
+ * not_found; 422 = ambiguous (masked candidates at `error.details.candidates`);
+ * 429 = rate_limited; any other non-2xx throws. A legacy 200 body still carrying
+ * an explicit `status` discriminator is honored for backward compatibility.
+ *
+ * 🔴 SECURITY: on a thrown non-2xx the Error message contains ONLY the HTTP
+ * status — never the response body and never a resolved value.
+ */
+export async function resolveSecret(params: {
+  apiUrl: string;
+  botToken: string;
+  /** Alias the owner referenced: a display_name or a secret_id. */
+  alias: string;
+  signal?: AbortSignal;
+}): Promise<ResolveSecretResult> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/secrets/resolve`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { ...DEFAULT_HEADERS, Authorization: `Bearer ${params.botToken}` },
+    // The server binds the request field `query` and 400s when empty.
+    body: JSON.stringify({ query: params.alias }),
+    signal: params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+
+  // 404 = alias not found (or endpoint not deployed yet) → benign not_found.
+  if (resp.status === 404) return { status: "not_found" };
+
+  // 422 = ambiguous: masked candidate list at error.details.candidates. Reading
+  // THIS body is safe (masked identifiers only); no other error body is read.
+  if (resp.status === 422) {
+    const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+    const error = (raw?.error ?? {}) as Record<string, unknown>;
+    const details = (error.details ?? {}) as Record<string, unknown>;
+    const rawCandidates = Array.isArray(details.candidates) ? details.candidates : [];
+    return { status: "ambiguous", candidates: parseCandidates(rawCandidates) };
+  }
+
+  // 429 = per-IP resolve limiter rejected this call. Do NOT read the body.
+  if (resp.status === 429) return { status: "rate_limited" };
+
+  if (!resp.ok) {
+    // 🔴 SECURITY: never fold the response body into the error — a resolve
+    // endpoint handles plaintext secrets and this error reaches an LLM-visible
+    // tool result, so it must carry the HTTP status ONLY.
+    throw new Error(`resolveSecret failed (${resp.status})`);
+  }
+
+  const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!raw || typeof raw !== "object") {
+    throw new Error("resolveSecret returned an unparseable response");
+  }
+
+  const status = raw.status;
+
+  // Backward-compat: honor a legacy 200 body that still carries an explicit status.
+  if (status === "not_found") return { status: "not_found" };
+  if (status === "ambiguous") {
+    const rawCandidates = Array.isArray(raw.candidates) ? raw.candidates : [];
+    return { status: "ambiguous", candidates: parseCandidates(rawCandidates) };
+  }
+
+  // Resolved: current server returns 200 `{ secret_id?, value }` WITHOUT a status
+  // field, so a 200 carrying a non-empty `value` is resolved. Legacy
+  // `status:"resolved"` is also accepted.
+  if (status === "resolved" || (status === undefined && "value" in raw)) {
+    if (typeof raw.value !== "string" || raw.value.length === 0) {
+      throw new Error("resolveSecret resolved a secret with no value");
+    }
+    return {
+      status: "resolved",
+      value: raw.value,
+      secret_id: typeof raw.secret_id === "string" ? raw.secret_id : undefined,
+      display_name: typeof raw.display_name === "string" ? raw.display_name : undefined,
+    };
+  }
+
+  // 🔴 SECURITY: never fold the server-supplied status string into the error.
+  throw new Error("resolveSecret returned an unknown status");
+}
+
+// ─── Doc Comment / HTML Doc Reply (docs domain, not IM) ───────────────────────
+
+/**
+ * Turn a decimal integer string into a value `JSON.stringify` writes verbatim as
+ * a JSON *number*, with full precision preserved (via JSON.rawJSON).
+ *
+ * Docs comment ids are snowflakes (> 2^53). Routing one through `Number()` would
+ * silently land on an adjacent integer — the reply would attach to a DIFFERENT
+ * real comment. A quoted string is rejected by the number-typed server field.
+ * When the value cannot be represented losslessly this returns `undefined` (the
+ * caller then omits parentId and posts a root comment) rather than degrading to a
+ * lossy `Number()`.
+ */
+export function jsonNumberLiteral(decimal: string): unknown | undefined {
+  if (!/^[1-9]\d*$/.test(decimal)) return undefined;
+  const rawJSON = (JSON as unknown as { rawJSON?: (text: string) => unknown }).rawJSON;
+  if (typeof rawJSON === "function") return rawJSON(decimal);
+  const asNumber = Number(decimal);
+  return Number.isSafeInteger(asNumber) ? asNumber : undefined;
+}
+
+/** Matches the `failed (<status>)` fragment in this module's thrown error messages. */
+export const API_FETCH_STATUS_RE = /failed \((\d{3})\)/;
+
+/**
+ * Extract the HTTP status from an api.ts error. The fetch helpers here throw
+ * `Error("Octo API ... failed (<status>): ...")` on non-2xx, so the status is
+ * recoverable from the message. Returns undefined for errors without an embedded
+ * `(NNN)` (e.g. a network timeout).
+ */
+export function httpStatusFromApiFetchError(err: unknown): number | undefined {
+  const message = err instanceof Error ? err.message : String(err);
+  const match = message.match(API_FETCH_STATUS_RE);
+  return match ? Number(match[1]) : undefined;
+}
+
+/** The docs backend explicitly rejected this comment (2xx but a failure envelope). */
+export class DocCommentRejectedError extends Error {
+  readonly name = "DocCommentRejectedError";
+}
+
+/**
+ * Does retrying this doc-comment error stand a chance of succeeding? An envelope
+ * rejection is deterministic. So are most 4xx — except 408 / 423 / 425 / 429,
+ * which carry "come back later" semantics. Network / 5xx / timeout are retriable.
+ */
+export function isPermanentDocCommentFailure(err: unknown): boolean {
+  if (err instanceof DocCommentRejectedError) return true;
+  const status = httpStatusFromApiFetchError(err);
+  if (status === undefined) return false;
+  if (status === 408 || status === 423 || status === 425 || status === 429) return false;
+  return status >= 400 && status < 500;
+}
+
+/**
+ * Post a Bot comment under a document's comment thread (docs domain, unrelated to
+ * IM messages). `parentId` (a decimal snowflake string) is written losslessly via
+ * jsonNumberLiteral; when it cannot be represented the field is omitted and the
+ * comment is posted at the root rather than mis-attached.
+ *
+ * The platform returns a `{status, ...}` envelope: a business failure (doc gone,
+ * no permission, body too long) can still be HTTP 200. Since this POST is the
+ * only delivery receipt for the feature, we assert the SUCCESS shape
+ * (status === 1 / "1") and throw a DocCommentRejectedError otherwise — but a
+ * response with NO `status` field is treated per HTTP semantics (resolve), since
+ * the docs backend need not use the same envelope.
+ */
+export async function postDocComment(params: {
+  apiUrl: string;
+  botToken: string;
+  docId: string;
+  /** Comment-thread root id, a DECIMAL STRING (snowflake, kept off the JS number path). */
+  parentId?: string;
+  body: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const path = `/v1/bot/docs/${encodeURIComponent(params.docId)}/comments`;
+  const parentLiteral =
+    params.parentId !== undefined ? jsonNumberLiteral(params.parentId) : undefined;
+  const result = await postJson<{ status?: unknown; msg?: unknown; message?: unknown }>(
+    params.apiUrl,
+    params.botToken,
+    path,
+    {
+      body: params.body,
+      ...(parentLiteral !== undefined ? { parentId: parentLiteral } : {}),
+    },
+    params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  );
+
+  if (result && typeof result === "object" && !Array.isArray(result) && "status" in result) {
+    const { status } = result;
+    const ok = status === 1 || status === "1";
+    if (!ok) {
+      const detail = result.msg ?? result.message;
+      const detailText =
+        detail && typeof detail === "object" ? JSON.stringify(detail) : String(detail);
+      throw new DocCommentRejectedError(
+        `Octo API ${path} rejected the comment (status=${String(status)})${detail ? `: ${detailText}` : ""}`,
+      );
+    }
+  }
+}
+
+/**
+ * Doc-comment reply intent (closed set). `final` and `progress` MUST stay
+ * distinct: a `progress` frame is a mid-state and must not flip the parent
+ * comment to resolved.
+ *   - `final`    → `applied`
+ *   - `progress` → `partial`
+ *   - `notice`   → `question` (failure / timeout / fallback; never touched the doc)
+ */
+export type DocReplyIntent = "final" | "progress" | "notice";
+
+/** intent → comment status marker. Defaults conservatively to `applied`. */
+export function docReplyStatusOf(intent?: DocReplyIntent): string {
+  if (intent === "notice") return "question";
+  if (intent === "progress") return "partial";
+  return "applied";
+}
+
+/**
+ * Post a Bot reply under an HTML document (octo-doc) comment thread.
+ *
+ * This is NOT postDocComment: that hits `/v1/bot/docs/<docId>/comments` keyed by
+ * docId; an HTML doc is identified by an octo-doc slug the docs-backend cannot
+ * resolve. HTML comments live in octo-doc and go through its own agent-reply path
+ * under the `/docs-html` prefix (reverse-proxied to octo-doc in production).
+ */
+export async function postHtmlDocReply(params: {
+  apiUrl: string;
+  botToken: string;
+  slug: string;
+  parentId: string;
+  body: string;
+  /** See DocReplyIntent. Defaults to applied (preserves the prior contract). */
+  intent?: DocReplyIntent;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const path = `/docs-html/v1/agent/replies`;
+  await postJson(
+    params.apiUrl,
+    params.botToken,
+    path,
+    {
+      slug: params.slug,
+      parent_id: params.parentId,
+      text: params.body,
+      status: docReplyStatusOf(params.intent),
+    },
+    params.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  );
+  // No {status:1} envelope check: octo-doc returns {data}/{error}; a business
+  // failure is a non-2xx already thrown by postJson.
 }
