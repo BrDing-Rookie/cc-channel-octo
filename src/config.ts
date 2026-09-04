@@ -234,6 +234,17 @@ export interface Config {
      */
     cron?: boolean;
     /**
+     * A1/A3/A9: when true, give the agent an in-process `display_card` MCP tool
+     * (`octo_send_display_card`) to post a DISPLAY InteractiveCard(17) — rich,
+     * non-interactive Adaptive Card 1.5 output (KPI strips / tables / collapsible
+     * detail / copy buttons / links) — to the CURRENT session's channel. The
+     * delivery target comes from the trusted per-turn session coords, never from
+     * tool arguments, and the card is always sent as the bot's own identity (no
+     * OBO). Fail-closed against the server D12 card profile (display cards
+     * rejected unless the server Bot policy advertises them). Default off. Per-bot.
+     */
+    displayCard?: boolean;
+    /**
      * External MCP servers exposed to the agent, keyed by server name (tools
      * surface as `mcp__<name>__<tool>`). Merged with any in-process servers cc
      * injects per turn (cron, GROUP.md write-back) — a name clash lets those
