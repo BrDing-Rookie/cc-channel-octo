@@ -258,6 +258,28 @@ export interface Config {
      */
     sendMedia?: boolean;
     /**
+     * A4/A8: when true, give the agent an in-process `send_card` MCP tool
+     * (`octo_send_card`) to post an INTERACTIVE InteractiveCard(17) — Action.Submit
+     * buttons + optional inputs (confirmations / approvals / small menus / short
+     * forms) — to the CURRENT session's channel, and start the /v1/bot/events poll
+     * loop that delivers the resulting `card_action` clicks back into the same
+     * session as a re-run turn. The delivery target comes from the trusted per-turn
+     * session coords, never from tool arguments, and the card is always sent as the
+     * bot's own identity (no OBO). Fail-closed against the server D12 card profile
+     * (interactive cards degrade to plain text unless the Bot policy advertises
+     * them). The click callback verifies requester identity + card-session ownership
+     * and dead-letters a persistently-failing action after 3 attempts. Default off.
+     * Per-bot.
+     */
+    sendCard?: boolean;
+    /**
+     * A5/A8: seconds to let the server hold the /v1/bot/events queue open on each
+     * poll (long polling). 0 / unset keeps short polling (one read per ~2s). Any
+     * non-zero value is clamped to the server's supported range at runtime. Only
+     * has effect when `sendCard` is on (that is what starts the poll loop). Per-bot.
+     */
+    eventWaitSeconds?: number;
+    /**
      * External MCP servers exposed to the agent, keyed by server name (tools
      * surface as `mcp__<name>__<tool>`). Merged with any in-process servers cc
      * injects per turn (cron, GROUP.md write-back) — a name clash lets those

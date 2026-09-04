@@ -45,6 +45,22 @@ import {
   type MediaSendSessionCoords,
 } from './media-send-tool.js';
 import {
+  createInteractiveCardToolServer,
+  INTERACTIVE_CARD_TOOL_SERVER_NAME,
+  type InteractiveCardSessionCoords,
+} from './card-interactive-tool.js';
+import {
+  handleCardAction,
+  type CardActionDispatchResult,
+} from './card-action-handler.js';
+import { synthesizeCardActionMessage, type CardAction } from './card-action.js';
+import {
+  createFileEventCursorStore,
+  setCardEventPollStarter,
+  startEventPoller,
+  type EventPoller,
+} from './card-events-poll.js';
+import {
   createGroupMdToolServer,
   GROUP_MD_TOOL_SERVER_NAME,
   createThreadMdToolServer,
@@ -203,6 +219,10 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
   // shutdown.
   let cronStore: CronStore | undefined;
   let cronScheduler: CronScheduler | undefined;
+  // A4/A8: the /v1/bot/events poll loop that delivers card_action clicks. Started
+  // lazily (only once the bot actually sends an interactive card — see the poll
+  // starter wired below), so a bot that never sends one issues zero events traffic.
+  let cardEventPoller: EventPoller | undefined;
   // Set right after gateway construction; releaseLock is nonce-guarded so it is
   // a no-op until register() actually acquires the lock, and the catch can call
   // it to release that lock if a later step throws before return.
@@ -366,6 +386,59 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
       cronScheduler.start();
     }
 
+    // A4/A8: register the lazy card-event poll starter. It is invoked the first
+    // time this bot registers an interactive card (card-session.ts →
+    // requestCardEventPolling), so idle bots issue no events traffic. The poller
+    // is created exactly once; each delivered card_action is routed through the A8
+    // handler, whose `dispatch` re-runs the click as a normal turn — synthesizing a
+    // BotMessage from the verified action and driving the SAME handleMessage
+    // pipeline as real inbound / cron messages (no bespoke session/concurrency).
+    if (config.sdk.sendCard && config.botToken && config.apiUrl && config.botId) {
+      const apiUrl = config.apiUrl;
+      const botToken = config.botToken;
+      const accountId = config.botId;
+      const cursorStore = createFileEventCursorStore({ dir: config.dataDir });
+      const pollLog = {
+        info: (m: string): void => console.log(`[cc-channel-octo] ${label}${m}`),
+        error: (m: string): void => console.error(`[cc-channel-octo] ${label}${m}`),
+      };
+      // Re-run one verified card click as a normal turn. handleMessage owns routing,
+      // the per-session lock, and error handling; it resolves void on completion. A
+      // throw escapes to the A8 handler, which treats it as transient (bounded replay
+      // via the per-event attempt counter). During drain we drop the click (rejected)
+      // so the cursor advances instead of replaying forever against a closing gateway.
+      const dispatch = (action: CardAction) => async (): Promise<CardActionDispatchResult> => {
+        if (gateway.draining) return 'rejected';
+        const msg = synthesizeCardActionMessage(action, gateway.botId);
+        const p = handleMessage(msg, config, store, router, groupContext, streamRelay, gateway.botId, cronStore, groupMdCache, groupMdWriteback, threadMdCache, threadMdWriteback)
+          .finally(() => { activeHandlers.delete(p); });
+        activeHandlers.add(p);
+        await p;
+        return 'completed';
+      };
+      const onCardAction = async (action: CardAction): Promise<void> => {
+        await handleCardAction({
+          action,
+          accountId,
+          apiUrl,
+          botToken,
+          dispatch: dispatch(action),
+          log: { info: pollLog.info, warn: pollLog.error },
+        });
+      };
+      setCardEventPollStarter(accountId, () => {
+        if (cardEventPoller) return; // idempotent: create the loop exactly once
+        cardEventPoller = startEventPoller({
+          apiUrl,
+          botToken,
+          cursorStore,
+          onCardAction,
+          ...(config.sdk.eventWaitSeconds ? { waitSeconds: config.sdk.eventWaitSeconds } : {}),
+          log: pollLog,
+        });
+      });
+    }
+
     // Phase 2 (called by main() after cross-registration): open the WebSocket.
     // Async + awaited so a connection failure fails startup instead of leaving
     // the process "ready" with no inbound endpoint.
@@ -377,6 +450,8 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
     const shutdown = async (): Promise<void> => {
       clearInterval(cwdCleanupTimer);
       cronScheduler?.stop();
+      cardEventPoller?.stop();
+      setCardEventPollStarter(gateway.botId, undefined);
       await gateway.stop(activeHandlers);
       store.close();
     };
@@ -389,6 +464,7 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
     // them in multi-bot mode (the surviving bots keep the process alive).
     clearInterval(cwdCleanupTimer);
     cronScheduler?.stop();
+    cardEventPoller?.stop();
     // register() releases its own lock when IT fails; this covers the window
     // where register() succeeded (lock held) but a later step threw.
     releaseGatewayLock?.();
@@ -947,6 +1023,28 @@ export async function handleMessage(
         sessionOpts = {
           ...(sessionOpts ?? {}),
           mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [DISPLAY_CARD_TOOL_SERVER_NAME]: displayCardServer },
+        };
+      }
+
+      // A4/A8: when interactive cards are on, inject the send-card MCP tool bound to
+      // THIS session's channel coords (a sent card lands here), this turn's session
+      // key (so the eventual click re-runs in the SAME session), and the bot's own
+      // wire credentials + id (identity is always bot; the id is stored on the card
+      // session for the A8 identity check). The tool is fail-closed against the D12
+      // card profile. Per-turn server because the delivery channel differs per message.
+      if (config.sdk.sendCard && config.botToken && config.apiUrl && config.botId) {
+        const coords: InteractiveCardSessionCoords = { channelId, channelType };
+        const interactiveCardServer = createInteractiveCardToolServer(
+          { apiUrl: config.apiUrl, botToken: config.botToken, accountId: config.botId },
+          coords,
+          sessionKey,
+        );
+        sessionOpts = {
+          ...(sessionOpts ?? {}),
+          mcpServers: {
+            ...(sessionOpts?.mcpServers ?? {}),
+            [INTERACTIVE_CARD_TOOL_SERVER_NAME]: interactiveCardServer,
+          },
         };
       }
 
