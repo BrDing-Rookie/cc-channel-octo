@@ -35,6 +35,11 @@ import { CronStore } from './cron-store.js';
 import { CronScheduler } from './cron-scheduler.js';
 import { createCronToolServer, CRON_TOOL_SERVER_NAME, type CronSessionCoords } from './cron-tool.js';
 import {
+  createDisplayCardToolServer,
+  DISPLAY_CARD_TOOL_SERVER_NAME,
+  type DisplayCardSessionCoords,
+} from './card-display-tool.js';
+import {
   createGroupMdToolServer,
   GROUP_MD_TOOL_SERVER_NAME,
   createThreadMdToolServer,
@@ -920,6 +925,23 @@ export async function handleMessage(
         sessionOpts = {
           ...(sessionOpts ?? {}),
           mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [CRON_TOOL_SERVER_NAME]: cronServer },
+        };
+      }
+
+      // A9: when display cards are on, inject the display-card MCP tool bound to
+      // THIS session's channel coords (a sent card lands here) and the bot's own
+      // wire credentials (identity is always bot; no OBO from model input). The
+      // tool itself is fail-closed against the server D12 card profile. Per-turn
+      // server because the delivery channel differs per message.
+      if (config.sdk.displayCard && config.botToken && config.apiUrl) {
+        const coords: DisplayCardSessionCoords = { channelId, channelType };
+        const displayCardServer = createDisplayCardToolServer(
+          { apiUrl: config.apiUrl, botToken: config.botToken },
+          coords,
+        );
+        sessionOpts = {
+          ...(sessionOpts ?? {}),
+          mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [DISPLAY_CARD_TOOL_SERVER_NAME]: displayCardServer },
         };
       }
 
