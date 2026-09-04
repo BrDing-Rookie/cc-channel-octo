@@ -8,42 +8,46 @@
  * in media-send-tool.ts; this module is the pure-ish orchestration.
  *
  * A single send is three steps:
- *   1. resolve the media source → a byte body + size + contentType + filename
+ *   1. resolve the media source → an open byte body + size + contentType + name
  *      (`resolveMediaSource`),
  *   2. upload it via a server-issued presigned PUT → a serveable downloadUrl
  *      (`uploadResolvedMedia`),
  *   3. POST the message (`sendMediaMessage` type Image/File, or
  *      `sendRichTextMessage` type 14 for mixed text+image).
  *
- * ── Security (hard acceptance items for this batch) ──────────────────────────
+ * ── Security (hard acceptance items + review round 1 fixes) ──────────────────
  *   • **Size cap** — every source is bounded by `MAX_OUTBOUND_UPLOAD_BYTES`
- *     BEFORE the presigned PUT (a `data:` URI is measured from its base64 length
- *     without allocating the full Buffer; an HTTP body is capped WHILE streaming;
- *     a local file is stat-checked). The cap is enforced pre-upload so we never
- *     sign / burn an upload on an oversize object.
- *   • **Stream to a temp file** — an HTTP media source is streamed to a temp file
- *     with backpressure + a hard byte cap (never buffered whole in memory), then
- *     the temp file is streamed into the PUT and unlinked in `finally`.
- *   • **SSRF on HTTP media sources** — we REUSE the inbound defense verbatim
- *     (`assertPublicUrl` + `fetchWithRedirectGuard` from url-policy.ts, with the
- *     bot token scoped per-hop to the apiUrl host via `isSameHost`, exactly as
- *     media-inbound.ts does). No second SSRF policy is invented here.
- *   • **Local paths are sandbox-confined** — cc's agent is driven by untrusted IM
- *     users, so (unlike openclaw) an arbitrary absolute path / `file://` URL is
- *     REJECTED. A local source must be a path inside the session cwd sandbox;
- *     the resolved realpath is verified to stay within `cwdDir`, closing an
- *     exfiltration sink (`send /etc/passwd`).
+ *     BEFORE the presigned PUT (a base64 `data:` URI is measured from its base64
+ *     length without allocating; an HTTP body is capped WHILE streaming; a local
+ *     file is fstat-checked on the open fd). Enforced pre-upload so we never sign
+ *     an upload on an oversize object.
+ *   • **Stream to a private temp file** — an HTTP media source is streamed to a
+ *     temp file (dir 0700, file 0600, O_EXCL — not umask-dependent) with
+ *     backpressure + a hard byte cap, then streamed into the PUT from an open fd
+ *     and unlinked in `finally`. Stale temp files (crashed prior runs) are swept
+ *     opportunistically.
+ *   • **SSRF on HTTP media sources** — reuses the inbound defense verbatim
+ *     (`assertPublicUrl` + `fetchWithRedirectGuard` from url-policy.ts). NOTE:
+ *     unlike the inbound path, the outbound fetch attaches **no Authorization**
+ *     — the source URL is model-controlled, so replaying the bot token to a
+ *     same-origin Bot API endpoint would let a prompt-injected agent read + exfil
+ *     API responses (review R1 #1). Outbound media fetch is unauthenticated.
+ *   • **Local paths are sandbox-confined, TOCTOU-safe** — a local source must be
+ *     a path inside the session cwd sandbox. We open the fd FIRST, verify the
+ *     OPENED inode's real path stays within `cwdDir`, fstat that fd, and stream
+ *     the upload from the SAME fd — never re-opening by path across the async
+ *     presign boundary, so a symlink swap after validation cannot redirect the
+ *     bytes (review R1 #2). Absolute paths / `file://` are rejected outright.
  */
 
-import { createReadStream, createWriteStream, statSync } from 'node:fs';
-import { mkdir, unlink, realpath } from 'node:fs/promises';
-import { open } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { mkdir, unlink, realpath, chmod, open, readlink, readdir, stat } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import { assertPublicUrl, fetchWithRedirectGuard } from './url-policy.js';
-import { isSameHost } from './inbound.js';
 import {
   getUploadPresign,
   uploadFileToPresignedUrl,
@@ -68,11 +72,22 @@ import {
  */
 export const MAX_OUTBOUND_UPLOAD_BYTES = 100 * 1024 * 1024;
 
-/** Temp dir for HTTP media streamed to disk before upload. */
+/** Private temp dir for HTTP media streamed to disk before upload (0700). */
 const UPLOAD_TEMP_DIR = path.join(os.tmpdir(), 'cc-octo-upload');
+
+/** Mode for the private temp dir — owner-only (rwx). Not umask-dependent. */
+const TEMP_DIR_MODE = 0o700;
+/** Mode for temp media files — owner read/write only. Not umask-dependent. */
+const TEMP_FILE_MODE = 0o600;
 
 /** Default timeout for streaming a remote media source to disk. */
 const DOWNLOAD_TIMEOUT_MS = 300_000;
+
+/** Age past which a leftover temp file is considered stale (crashed run). */
+const STALE_TEMP_AGE_MS = 60 * 60 * 1000; // 1h
+
+/** Header window read for image-dimension parsing. */
+const IMAGE_HEADER_SIZE = 65536;
 
 /**
  * Strip any path separators / traversal from a caller-influenced filename so it
@@ -149,36 +164,67 @@ export function parseImageDimensions(buf: Buffer, mime: string): { width: number
   return null;
 }
 
-/** Parse image dimensions from a file by reading only the first 64KB. */
-export async function parseImageDimensionsFromFile(
-  filePath: string,
+/**
+ * Parse image dimensions from an OPEN file handle by reading only the first
+ * 64KB via a positional read (pread at offset 0 — does not disturb the fd
+ * offset, so the upload read-stream can still start at 0). Race-safe: reads
+ * from the same validated fd, never re-opening by path.
+ */
+async function parseImageDimensionsFromHandle(
+  fh: FileHandle,
   mime: string,
 ): Promise<{ width: number; height: number } | null> {
-  const HEADER_SIZE = 65536;
-  let fh: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    fh = await open(filePath, 'r');
-    const buf = Buffer.alloc(HEADER_SIZE);
-    const { bytesRead } = await fh.read(buf, 0, HEADER_SIZE, 0);
+    const buf = Buffer.alloc(IMAGE_HEADER_SIZE);
+    const { bytesRead } = await fh.read(buf, 0, IMAGE_HEADER_SIZE, 0);
     return parseImageDimensions(buf.subarray(0, bytesRead), mime);
   } catch { /* ignore read/parse errors */ }
-  finally { await fh?.close(); }
   return null;
 }
 
+/** Ensure the private temp dir exists with owner-only perms (not umask-based). */
+async function ensureUploadTempDir(): Promise<string> {
+  await mkdir(UPLOAD_TEMP_DIR, { recursive: true, mode: TEMP_DIR_MODE });
+  // mkdir mode is masked by umask and skipped if the dir already existed; force
+  // the mode explicitly so a lax umask or a pre-existing dir can't widen it.
+  await chmod(UPLOAD_TEMP_DIR, TEMP_DIR_MODE).catch(() => {});
+  return UPLOAD_TEMP_DIR;
+}
+
 /**
- * Stream a Web ReadableStream to a file with a strict byte cap + backpressure.
- * Mirrors the inbound download loop (media-inbound.ts) so the two never drift:
- * the first chunk past `maxBytes` cancels the upstream reader, destroys the
- * write stream, unlinks the partial file, and throws.
+ * Opportunistically remove temp files left by a crashed prior run (older than
+ * STALE_TEMP_AGE_MS). Best-effort; never throws.
  */
-async function streamToFileWithCap(opts: {
+export async function cleanupStaleUploadTempFiles(now: number = Date.now()): Promise<void> {
+  try {
+    const files = await readdir(UPLOAD_TEMP_DIR);
+    for (const f of files) {
+      const fp = path.join(UPLOAD_TEMP_DIR, f);
+      const st = await stat(fp).catch(() => null);
+      if (st && st.isFile() && now - st.mtimeMs > STALE_TEMP_AGE_MS) {
+        await unlink(fp).catch(() => {});
+      }
+    }
+  } catch { /* dir may not exist yet */ }
+}
+
+/**
+ * Stream a Web ReadableStream to a fresh temp file with a strict byte cap +
+ * backpressure. The file is created O_EXCL with mode 0600 (an attacker cannot
+ * pre-plant a symlink at the random path, and the bytes are never group/world
+ * readable). Mirrors the inbound download loop (media-inbound.ts): the first
+ * chunk past `maxBytes` cancels the reader, destroys the stream, unlinks the
+ * partial file, and throws.
+ */
+async function streamToTempFileWithCap(opts: {
   body: ReadableStream<Uint8Array>;
   destPath: string;
   maxBytes: number;
 }): Promise<void> {
   const { body, destPath, maxBytes } = opts;
-  const ws = createWriteStream(destPath);
+  // 'wx' = O_CREAT | O_EXCL — fail if the path already exists (defeats a planted
+  // symlink); mode 0600 owner-only (chmod below defeats umask on top of it).
+  const ws = createWriteStream(destPath, { flags: 'wx', mode: TEMP_FILE_MODE });
   let totalBytes = 0;
 
   const streamError = new Promise<never>((_, reject) => {
@@ -188,6 +234,14 @@ async function streamToFileWithCap(opts: {
 
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
+    // Wait for the fd (race the 'open' against an early 'error', e.g. O_EXCL
+    // collision), then force 0600 regardless of umask.
+    await Promise.race([
+      new Promise<void>((resolve) => ws.once('open', () => resolve())),
+      streamError,
+    ]);
+    await chmod(destPath, TEMP_FILE_MODE).catch(() => {});
+
     reader = body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
@@ -217,19 +271,30 @@ async function streamToFileWithCap(opts: {
   }
 }
 
-/** A media source resolved to bytes, ready to upload. */
+/**
+ * A media source resolved to bytes, ready to upload.
+ *
+ * Exactly one body carrier is set:
+ *   - `fileBuffer` — a small in-memory body (data: URIs), OR
+ *   - `fileHandle` — an OPEN, validated fd (local sandbox file OR downloaded
+ *     temp file). The upload streams from this fd; it is never re-opened by
+ *     path. The caller MUST `close()` it (and unlink `tempPath` if set).
+ */
 export interface ResolvedMedia {
-  /** In-memory body (data: URIs only). Mutually exclusive with bodyPath. */
   fileBuffer?: Buffer;
-  /** On-disk body to stream from (local file / downloaded temp). */
-  bodyPath?: string;
+  fileHandle?: FileHandle;
   fileSize: number;
   contentType: string;
   filename: string;
-  /** Path usable for dimension parsing (local file / temp). */
-  localFilePath?: string;
-  /** A temp file WE created that the caller must unlink after use. */
+  /** A temp file WE created that the caller must unlink after closing the fd. */
   tempPath?: string;
+}
+
+/** Release a resolved source's held resources (fd + temp file). Never throws. */
+export async function disposeResolvedMedia(r: ResolvedMedia | undefined): Promise<void> {
+  if (!r) return;
+  await r.fileHandle?.close().catch(() => {});
+  if (r.tempPath) await unlink(r.tempPath).catch(() => {});
 }
 
 /** Extension guess for a data: URI content type when no filename is supplied. */
@@ -241,15 +306,81 @@ const DATA_URI_EXT: Record<string, string> = {
 };
 
 /**
- * Resolve a media `source` into bytes ready for a presigned upload.
+ * Decode the body of a `data:` URI per RFC 2397.
+ *
+ * `data:[<mediatype>][;base64],<data>` — only the `;base64` form is base64; the
+ * default form is percent-encoded text (previously this silently base64-decoded
+ * BOTH, turning `data:text/plain,hello%20world` into garbage — review R1 #4).
+ */
+function decodeDataUri(src: string, maxBytes: number, filenameHint?: string): ResolvedMedia {
+  const comma = src.indexOf(',');
+  if (comma < 0) throw new Error('data URI 格式非法');
+  const header = src.slice('data:'.length, comma); // between "data:" and ","
+  const data = src.slice(comma + 1);
+
+  const isBase64 = /;base64$/i.test(header);
+  const mediatype = (isBase64 ? header.replace(/;base64$/i, '') : header).trim();
+  // First segment is the MIME; drop any parameters (e.g. ";charset=utf-8").
+  // RFC default when omitted is text/plain.
+  const contentType = (mediatype.split(';')[0] || 'text/plain').toLowerCase() || 'text/plain';
+
+  let buf: Buffer;
+  if (isBase64) {
+    const trimmed = data.replace(/\s/g, '');
+    const padding = trimmed.endsWith('==') ? 2 : trimmed.endsWith('=') ? 1 : 0;
+    const decodedSize = Math.floor((trimmed.length * 3) / 4) - padding;
+    if (decodedSize > maxBytes) {
+      throw new Error(`媒体超过大小上限 ${maxBytes} 字节 (约 ${decodedSize} 字节)`);
+    }
+    buf = Buffer.from(trimmed, 'base64');
+  } else {
+    // Percent-encoded text. The decoded byte length is bounded by the source
+    // length we already hold (no amplification), so decode then check.
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(data);
+    } catch {
+      throw new Error('data URI 百分号编码非法');
+    }
+    buf = Buffer.from(decoded, 'utf-8');
+  }
+  if (buf.length > maxBytes) {
+    throw new Error(`媒体超过大小上限 ${maxBytes} 字节 (${buf.length} 字节)`);
+  }
+  const ext = DATA_URI_EXT[contentType] ?? '.bin';
+  const filename = filenameHint ? sanitizeFilename(filenameHint) : `file${ext}`;
+  return { fileBuffer: buf, fileSize: buf.length, contentType, filename };
+}
+
+/**
+ * Resolve the real path of an OPEN fd (Linux: /proc/self/fd). This reflects the
+ * inode actually opened, so a later path swap cannot change it. Falls back to
+ * realpath(originalPath) on platforms without /proc (best-effort).
+ */
+async function realPathOfFd(fh: FileHandle, fallbackPath: string): Promise<string> {
+  try {
+    return await readlink(`/proc/self/fd/${fh.fd}`);
+  } catch {
+    return await realpath(fallbackPath).catch(() => fallbackPath);
+  }
+}
+
+/**
+ * Resolve a media `source` into an open, validated body ready for a presigned
+ * upload.
  *
  * `source` is one of:
- *   - `data:[<mime>][;base64],<data>` — inline; size estimated then buffered.
- *   - `http(s)://…`                   — SSRF-guarded stream to a temp file.
- *   - a path RELATIVE to `cwdDir`     — local file inside the session sandbox.
+ *   - `data:[<mime>][;base64],<data>` — inline; base64 or percent-decoded.
+ *   - `http(s)://…`                   — SSRF-guarded, UNAUTHENTICATED stream to
+ *                                       a private temp file.
+ *   - a path RELATIVE to `cwdDir`     — local file inside the session sandbox,
+ *                                       opened + confinement-checked on the fd.
  *
  * Absolute paths and `file://` URLs are rejected: the untrusted-driven agent
  * must not be able to read arbitrary host files into a group message.
+ *
+ * On success the returned {@link ResolvedMedia} may hold an OPEN fd and/or a
+ * temp file — the caller MUST pass it to {@link disposeResolvedMedia} when done.
  */
 export async function resolveMediaSource(params: {
   source: string;
@@ -260,35 +391,17 @@ export async function resolveMediaSource(params: {
   maxBytes?: number;
   signal?: AbortSignal;
 }): Promise<ResolvedMedia> {
-  const { source, cwdDir, apiUrl, botToken, filenameHint } = params;
+  const { source, cwdDir, filenameHint } = params;
   const maxBytes = params.maxBytes ?? MAX_OUTBOUND_UPLOAD_BYTES;
   const src = source.trim();
   if (!src) throw new Error('媒体来源为空');
 
   // ── data: URI ──────────────────────────────────────────────────────────
   if (src.startsWith('data:')) {
-    const match = src.match(/^data:([^;,]+)?(?:;base64)?,(.*)$/s);
-    if (!match) throw new Error('data URI 格式非法');
-    const contentType = match[1] || 'application/octet-stream';
-    const b64 = match[2];
-    // Estimate decoded size from base64 length BEFORE allocating the Buffer,
-    // so an oversize data: URI is rejected without the full allocation.
-    const trimmed = b64.replace(/\s/g, '');
-    const padding = trimmed.endsWith('==') ? 2 : trimmed.endsWith('=') ? 1 : 0;
-    const decodedSize = Math.floor((trimmed.length * 3) / 4) - padding;
-    if (decodedSize > maxBytes) {
-      throw new Error(`媒体超过大小上限 ${maxBytes} 字节 (约 ${decodedSize} 字节)`);
-    }
-    const buf = Buffer.from(b64, 'base64');
-    if (buf.length > maxBytes) {
-      throw new Error(`媒体超过大小上限 ${maxBytes} 字节 (${buf.length} 字节)`);
-    }
-    const ext = DATA_URI_EXT[contentType] ?? '.bin';
-    const filename = filenameHint ? sanitizeFilename(filenameHint) : `file${ext}`;
-    return { fileBuffer: buf, fileSize: buf.length, contentType, filename };
+    return decodeDataUri(src, maxBytes, filenameHint);
   }
 
-  // ── http(s) URL — SSRF-guarded stream to temp file ───────────────────────
+  // ── http(s) URL — SSRF-guarded, UNAUTHENTICATED stream to temp file ──────
   if (/^https?:\/\//i.test(src)) {
     // Fail fast before any network I/O for the obvious private/loopback cases;
     // fetchWithRedirectGuard re-validates every hop.
@@ -301,14 +414,12 @@ export async function resolveMediaSource(params: {
     filename = sanitizeFilename(filenameHint ?? filename);
 
     const signal = params.signal ?? AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS);
-    // Scope Authorization PER HOP: only send the bot token while the current
-    // hop is same-host as apiUrl (a redirect elsewhere drops it) — identical to
-    // the inbound download path (media-inbound.ts).
-    const resp = await fetchWithRedirectGuard(src, (currentUrl) => {
-      const headers: Record<string, string> = {};
-      if (isSameHost(currentUrl, apiUrl)) headers.Authorization = `Bearer ${botToken}`;
-      return { headers, signal };
-    });
+    // R1 #1: the source URL is MODEL-CONTROLLED. Unlike the inbound path we do
+    // NOT attach the bot token — replaying it to a same-origin Bot API endpoint
+    // (e.g. /v1/bot/upload/credentials) would let a prompt-injected agent read
+    // the response (temp secrets) and exfil it into the channel. Outbound media
+    // fetch is unauthenticated; SSRF re-validation on every hop still applies.
+    const resp = await fetchWithRedirectGuard(src, () => ({ signal }));
     if (!resp.ok) throw new Error(`下载媒体失败 HTTP ${resp.status}`);
     if (!resp.body) throw new Error('媒体响应无内容');
 
@@ -317,26 +428,32 @@ export async function resolveMediaSource(params: {
       contentType = inferContentType(filename);
     }
 
-    await mkdir(UPLOAD_TEMP_DIR, { recursive: true });
+    await ensureUploadTempDir();
+    // Sweep stale temp files from crashed prior runs (best-effort, fire-and-forget).
+    void cleanupStaleUploadTempFiles();
     const tempPath = path.join(UPLOAD_TEMP_DIR, `${randomUUID()}-${filename}`);
-    await streamToFileWithCap({
+    await streamToTempFileWithCap({
       body: resp.body as ReadableStream<Uint8Array>,
       destPath: tempPath,
       maxBytes,
     });
-    const size = statSync(tempPath).size;
-    if (size === 0) {
+
+    // Open a READ fd on the just-written temp file (before any later async
+    // boundary) and fstat IT — the upload streams from this fd, never re-opening.
+    let fh: FileHandle;
+    try {
+      fh = await open(tempPath, 'r');
+    } catch (err) {
+      await unlink(tempPath).catch(() => {});
+      throw err;
+    }
+    const st = await fh.stat();
+    if (st.size === 0) {
+      await fh.close().catch(() => {});
       await unlink(tempPath).catch(() => {});
       throw new Error('媒体为空');
     }
-    return {
-      bodyPath: tempPath,
-      tempPath,
-      localFilePath: tempPath,
-      fileSize: size,
-      contentType,
-      filename,
-    };
+    return { fileHandle: fh, tempPath, fileSize: st.size, contentType, filename };
   }
 
   // ── explicit rejection of absolute paths / file:// (sandbox escape) ───────
@@ -346,39 +463,43 @@ export async function resolveMediaSource(params: {
     );
   }
 
-  // ── local file, relative to the session cwd sandbox ──────────────────────
+  // ── local file, relative to the session cwd sandbox (TOCTOU-safe) ─────────
   const resolvedPath = path.resolve(cwdDir, src);
-  // Confine to the sandbox: compare realpaths so a symlink cannot escape.
   let realCwd: string;
-  let realTarget: string;
   try {
     realCwd = await realpath(cwdDir);
   } catch {
     realCwd = path.resolve(cwdDir);
   }
+
+  // Open the fd FIRST, then validate the OPENED inode's real path. A symlink
+  // swap of `resolvedPath` after this open cannot change what the fd points to,
+  // and we stream the upload from this very fd (R1 #2).
+  let fh: FileHandle;
   try {
-    realTarget = await realpath(resolvedPath);
+    fh = await open(resolvedPath, 'r');
   } catch {
     throw new Error(`本地文件不存在或不可读: ${src}`);
   }
-  const rel = path.relative(realCwd, realTarget);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error('拒绝上传会话工作目录之外的文件');
+  try {
+    const openedReal = await realPathOfFd(fh, resolvedPath);
+    const rel = path.relative(realCwd, openedReal);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      // rel === '' would mean the cwd dir itself; not a file to send.
+      throw new Error('拒绝上传会话工作目录之外的文件');
+    }
+    const st = await fh.stat();
+    if (!st.isFile()) throw new Error(`不是常规文件: ${src}`);
+    if (st.size > maxBytes) {
+      throw new Error(`媒体超过大小上限 ${maxBytes} 字节 (${st.size} 字节)`);
+    }
+    if (st.size === 0) throw new Error('媒体为空');
+    const filename = sanitizeFilename(filenameHint ?? path.basename(openedReal));
+    return { fileHandle: fh, fileSize: st.size, contentType: inferContentType(filename), filename };
+  } catch (err) {
+    await fh.close().catch(() => {});
+    throw err;
   }
-  const st = statSync(realTarget);
-  if (!st.isFile()) throw new Error(`不是常规文件: ${src}`);
-  if (st.size > maxBytes) {
-    throw new Error(`媒体超过大小上限 ${maxBytes} 字节 (${st.size} 字节)`);
-  }
-  if (st.size === 0) throw new Error('媒体为空');
-  const filename = sanitizeFilename(filenameHint ?? path.basename(realTarget));
-  return {
-    bodyPath: realTarget,
-    localFilePath: realTarget,
-    fileSize: st.size,
-    contentType: inferContentType(filename),
-    filename,
-  };
 }
 
 /** An uploaded media asset — its serveable URL plus display metadata. */
@@ -394,9 +515,11 @@ export interface UploadedMedia {
 
 /**
  * Upload an already-resolved media body via a server-issued presigned PUT (C3)
- * and return its serveable download URL + display metadata. Opens the read
- * stream lazily (after presign succeeds) so a presign failure never dangles an
- * open fd against a temp file.
+ * and return its serveable download URL + display metadata.
+ *
+ * The body comes from the resolved source's in-memory buffer OR its already-open
+ * fd — we NEVER re-open by path here (the fd was opened + validated in
+ * `resolveMediaSource`, so the presign await between cannot be raced, R1 #2).
  */
 export async function uploadResolvedMedia(params: {
   resolved: ResolvedMedia;
@@ -406,6 +529,21 @@ export async function uploadResolvedMedia(params: {
 }): Promise<UploadedMedia> {
   const { resolved, apiUrl, botToken, signal } = params;
   const contentType = resolved.contentType || 'application/octet-stream';
+  const isImage = contentType.startsWith('image/');
+
+  // Parse dimensions BEFORE building the upload stream (positional read at 0 for
+  // the fd form; direct for the buffer form) so we can start the upload at 0.
+  let width: number | undefined;
+  let height: number | undefined;
+  if (isImage) {
+    const dims = resolved.fileBuffer
+      ? parseImageDimensions(resolved.fileBuffer, contentType)
+      : resolved.fileHandle
+        ? await parseImageDimensionsFromHandle(resolved.fileHandle, contentType)
+        : null;
+    width = dims?.width;
+    height = dims?.height;
+  }
 
   const presign = await getUploadPresign({
     apiUrl,
@@ -416,8 +554,9 @@ export async function uploadResolvedMedia(params: {
     signal,
   });
 
+  // Body: buffer (data URI) or a read stream on the SAME validated fd (start:0).
   const fileBody: Buffer | NodeJS.ReadableStream =
-    resolved.fileBuffer ?? createReadStream(resolved.bodyPath!);
+    resolved.fileBuffer ?? resolved.fileHandle!.createReadStream({ start: 0, autoClose: false });
   const { url } = await uploadFileToPresignedUrl({
     uploadUrl: presign.uploadUrl,
     downloadUrl: presign.downloadUrl,
@@ -430,18 +569,6 @@ export async function uploadResolvedMedia(params: {
     signal,
   });
 
-  const isImage = contentType.startsWith('image/');
-  let width: number | undefined;
-  let height: number | undefined;
-  if (isImage) {
-    const dims = resolved.localFilePath
-      ? await parseImageDimensionsFromFile(resolved.localFilePath, contentType)
-      : resolved.fileBuffer
-        ? parseImageDimensions(resolved.fileBuffer, contentType)
-        : null;
-    width = dims?.width;
-    height = dims?.height;
-  }
   return {
     url,
     filename: resolved.filename,
@@ -524,7 +651,7 @@ export async function sendMediaToChannel(params: {
       height: uploaded.height,
     };
   } finally {
-    if (resolved.tempPath) await unlink(resolved.tempPath).catch(() => {});
+    await disposeResolvedMedia(resolved);
   }
 }
 
@@ -564,7 +691,7 @@ export async function sendRichTextToChannel(params: {
   const imageBlocks: RichTextBlock[] = [];
   const sideloads: UploadedMedia[] = [];
   const failedMedia: Array<{ source: string; error: string }> = [];
-  const tempPaths: string[] = [];
+  const resolvedToDispose: ResolvedMedia[] = [];
 
   try {
     for (const source of images) {
@@ -578,7 +705,7 @@ export async function sendRichTextToChannel(params: {
           maxBytes: params.maxBytes,
           signal: params.signal,
         });
-        if (resolved.tempPath) tempPaths.push(resolved.tempPath);
+        resolvedToDispose.push(resolved);
         const uploaded = await uploadResolvedMedia({
           resolved,
           apiUrl,
@@ -671,6 +798,6 @@ export async function sendRichTextToChannel(params: {
     const extra = await deliverSideloads();
     return { messageId, imageCount: imageBlocks.length + extra, failedMedia, richText: true };
   } finally {
-    for (const tp of tempPaths) await unlink(tp).catch(() => {});
+    for (const r of resolvedToDispose) await disposeResolvedMedia(r);
   }
 }

@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
-import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, mkdir, stat, readdir, symlink, unlink, utimes, open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -28,12 +28,24 @@ vi.mock('../octo/api.js', () => ({
 
 import {
   resolveMediaSource,
+  disposeResolvedMedia,
   sendMediaToChannel,
   sendRichTextToChannel,
   parseImageDimensions,
+  cleanupStaleUploadTempFiles,
   MAX_OUTBOUND_UPLOAD_BYTES,
 } from '../media-outbound.js';
 import { ChannelType } from '../octo/types.js';
+
+const UPLOAD_TEMP_DIR = path.join(tmpdir(), 'cc-octo-upload');
+
+/** Consume a Web/Node stream (or buffer) into a Buffer. */
+async function drain(body: unknown): Promise<Buffer> {
+  if (Buffer.isBuffer(body)) return body;
+  const chunks: Buffer[] = [];
+  for await (const c of body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(c));
+  return Buffer.concat(chunks);
+}
 
 /** A minimal valid PNG header advertising a `w`×`h` image. */
 function pngBuffer(w: number, h: number): Buffer {
@@ -138,8 +150,9 @@ describe('resolveMediaSource — SSRF + path confinement', () => {
     const r = await resolveMediaSource({ source: 'out/chart.png', cwdDir: cwd, ...BASE });
     expect(r.contentType).toBe('image/png');
     expect(r.filename).toBe('chart.png');
-    expect(r.bodyPath).toBeTruthy();
+    expect(r.fileHandle).toBeTruthy();
     expect(r.fileSize).toBeGreaterThan(0);
+    await disposeResolvedMedia(r);
   });
 
   it('rejects an empty local file', async () => {
@@ -247,3 +260,157 @@ describe('parseImageDimensions', () => {
     expect(MAX_OUTBOUND_UPLOAD_BYTES).toBeGreaterThan(0);
   });
 });
+
+// ─── R1 #1: outbound HTTP fetch must NOT carry the bot token ──────────────────
+describe('resolveMediaSource — outbound fetch is unauthenticated (R1 #1)', () => {
+  it('does not attach Authorization to a same-origin non-media API URL', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'application/octet-stream' } }),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    // apiUrl host == source host (same origin), and the path is a Bot API, not media.
+    const r = await resolveMediaSource({
+      source: 'http://93.184.216.34/v1/bot/upload/credentials',
+      cwdDir: cwd,
+      apiUrl: 'https://93.184.216.34',
+      botToken: 'bf_secret',
+    });
+    await disposeResolvedMedia(r);
+    expect(fetchSpy).toHaveBeenCalled();
+    // No hop may carry an Authorization header, and the token must not appear anywhere.
+    for (const call of fetchSpy.mock.calls) {
+      const init = (call[1] ?? {}) as RequestInit;
+      const headers = new Headers(init.headers as HeadersInit | undefined);
+      expect(headers.has('authorization')).toBe(false);
+      expect(JSON.stringify(init.headers ?? {})).not.toContain('bf_secret');
+    }
+  });
+});
+
+// ─── R1 #2: cwd realpath TOCTOU — fd is pinned at validation ──────────────────
+describe('resolveMediaSource — TOCTOU-safe fd pinning (R1 #2)', () => {
+  it('rejects a symlink inside cwd that points outside the sandbox', async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), 'cc-out-jail-'));
+    try {
+      await writeFile(path.join(outside, 'secret.txt'), 'TOP SECRET');
+      await symlink(path.join(outside, 'secret.txt'), path.join(cwd, 'link.txt'));
+      await expect(
+        resolveMediaSource({ source: 'link.txt', cwdDir: cwd, ...BASE }),
+      ).rejects.toThrow(/工作目录之外/);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('streams the ORIGINAL inode even if the path is swapped to an outside symlink after validation', async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), 'cc-out-swap-'));
+    try {
+      const original = Buffer.from('ORIGINAL-INSIDE-CONTENT!!');
+      const swapped = Buffer.alloc(original.length, 0x58); // same size, different bytes
+      await writeFile(path.join(outside, 'evil.bin'), swapped);
+      await writeFile(path.join(cwd, 'file.bin'), original);
+
+      // Validation opens + pins the fd.
+      const r = await resolveMediaSource({ source: 'file.bin', cwdDir: cwd, ...BASE });
+      try {
+        // Attacker swaps the path to a symlink pointing OUTSIDE, same size.
+        await unlink(path.join(cwd, 'file.bin'));
+        await symlink(path.join(outside, 'evil.bin'), path.join(cwd, 'file.bin'));
+
+        // The upload streams from the pinned fd → original bytes, NOT the swap.
+        const streamed = await drain(r.fileHandle!.createReadStream({ start: 0, autoClose: false }));
+        expect(streamed.equals(original)).toBe(true);
+      } finally {
+        await disposeResolvedMedia(r);
+      }
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── R1 #3: private temp dir/file perms + stale cleanup ───────────────────────
+describe('temp file/dir hardening (R1 #3)', () => {
+  function httpResp(bytes: number): Response {
+    return new Response(
+      new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new Uint8Array(bytes)); c.close(); } }),
+      { status: 200, headers: { 'content-type': 'application/pdf' } },
+    );
+  }
+
+  it('creates the temp dir 0700 and the temp file 0600', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(httpResp(32)) as unknown as typeof fetch;
+    const r = await resolveMediaSource({ source: 'http://93.184.216.34/f.pdf', cwdDir: cwd, ...BASE });
+    try {
+      const dirMode = (await stat(UPLOAD_TEMP_DIR)).mode & 0o777;
+      const fileMode = (await stat(r.tempPath!)).mode & 0o777;
+      expect(dirMode).toBe(0o700);
+      expect(fileMode).toBe(0o600);
+    } finally {
+      await disposeResolvedMedia(r);
+    }
+  });
+
+  it('sweeps stale leftover temp files (crashed prior run)', async () => {
+    await mkdir(UPLOAD_TEMP_DIR, { recursive: true });
+    const staleFh = await open(path.join(UPLOAD_TEMP_DIR, 'stale-leftover.bin'), 'w');
+    await staleFh.close();
+    const fresh = path.join(UPLOAD_TEMP_DIR, 'fresh-keepme.bin');
+    const freshFh = await open(fresh, 'w');
+    await freshFh.close();
+    // Backdate the stale file 2h.
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(path.join(UPLOAD_TEMP_DIR, 'stale-leftover.bin'), twoHoursAgo, twoHoursAgo);
+
+    await cleanupStaleUploadTempFiles();
+    const remaining = await readdir(UPLOAD_TEMP_DIR);
+    expect(remaining).not.toContain('stale-leftover.bin');
+    expect(remaining).toContain('fresh-keepme.bin');
+    await unlink(fresh).catch(() => {});
+  });
+
+  it('leaves no temp file behind when the upload fails', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(httpResp(16)) as unknown as typeof fetch;
+    getUploadPresign.mockResolvedValue({
+      uploadUrl: 'https://storage.example/put', downloadUrl: 'https://cdn.example/dl', contentType: 'application/pdf',
+    });
+    uploadFileToPresignedUrl.mockRejectedValue(new Error('boom upload'));
+    await expect(
+      sendMediaToChannel({ source: 'http://93.184.216.34/f.pdf', cwdDir: cwd, ...BASE, ...CHAN }),
+    ).rejects.toThrow(/boom upload/);
+    // The temp file created for this send must be gone (finally → dispose).
+    const remaining = (await readdir(UPLOAD_TEMP_DIR).catch(() => [])).filter((f) => f.endsWith('-f.pdf'));
+    expect(remaining).toHaveLength(0);
+  });
+});
+
+// ─── R1 #4: data URI base64 vs percent-encoding (RFC 2397) ────────────────────
+describe('resolveMediaSource — data URI decoding (R1 #4)', () => {
+  it('base64-decodes only when the ;base64 marker is present', async () => {
+    const r = await resolveMediaSource({ source: 'data:text/plain;base64,aGVsbG8=', cwdDir: cwd, ...BASE });
+    expect(r.fileBuffer?.toString('utf-8')).toBe('hello');
+    expect(r.contentType).toBe('text/plain');
+    await disposeResolvedMedia(r);
+  });
+
+  it('percent-decodes a non-base64 data URI (no longer garbles it)', async () => {
+    const r = await resolveMediaSource({ source: 'data:text/plain,hello%20world', cwdDir: cwd, ...BASE });
+    expect(r.fileBuffer?.toString('utf-8')).toBe('hello world');
+    expect(r.contentType).toBe('text/plain');
+    await disposeResolvedMedia(r);
+  });
+
+  it('defaults to text/plain when the mediatype is omitted', async () => {
+    const r = await resolveMediaSource({ source: 'data:,abc', cwdDir: cwd, ...BASE });
+    expect(r.fileBuffer?.toString('utf-8')).toBe('abc');
+    expect(r.contentType).toBe('text/plain');
+    await disposeResolvedMedia(r);
+  });
+
+  it('rejects malformed percent-encoding', async () => {
+    await expect(
+      resolveMediaSource({ source: 'data:text/plain,bad%ZZ', cwdDir: cwd, ...BASE }),
+    ).rejects.toThrow(/百分号编码非法/);
+  });
+});
+
