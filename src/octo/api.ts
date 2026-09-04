@@ -20,6 +20,7 @@ import {
   type TargetCandidate,
   type BotEvent,
   type CardCaps,
+  type RichTextBlock,
 } from "./types.js";
 import { randomUUID } from "node:crypto";
 
@@ -116,6 +117,138 @@ export async function sendMessage(params: {
     type: MessageType.Text,
     content: params.content,
   };
+  if (
+    (params.mentionUids && params.mentionUids.length > 0) ||
+    (params.mentionEntities && params.mentionEntities.length > 0) ||
+    params.mentionAll
+  ) {
+    const mention: Record<string, unknown> = {};
+    if (params.mentionUids && params.mentionUids.length > 0) {
+      mention.uids = params.mentionUids;
+    }
+    if (params.mentionEntities && params.mentionEntities.length > 0) {
+      mention.entities = params.mentionEntities;
+    }
+    if (params.mentionAll) {
+      mention.all = 1;
+    }
+    payload.mention = mention;
+  }
+  if (params.replyMsgId) {
+    payload.reply = { message_id: params.replyMsgId };
+  }
+  return await postJson<SendMessageResult>(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload,
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+  }, params.signal);
+}
+
+/**
+ * Send a media message (image or file) to a channel.
+ *
+ * `type` selects the wire shape: Image(=2) carries width/height/name/size,
+ * File(=8) carries name/size. `url` MUST be a URL the server can serve — in
+ * practice the `downloadUrl` returned by {@link uploadFileToPresignedUrl} after
+ * a presigned upload (C3). This function only assembles + POSTs the payload; it
+ * does NOT upload — see media-outbound.ts for the resolve→upload→send path.
+ */
+export async function sendMediaMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  type: MessageType;
+  url: string;
+  name?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  mentionUids?: string[];
+  mentionEntities?: MentionEntity[];
+  clientMsgNo?: string;
+  signal?: AbortSignal;
+}): Promise<SendMessageResult | undefined> {
+  // Last-line guard: never POST an empty channel_id — the server answers an
+  // opaque 500. Callers resolve/validate the target up front; this is defense
+  // in depth for any path that bypasses them.
+  if (!params.channelId || !params.channelId.trim()) {
+    throw new Error("octo: channelId is required to send a media message");
+  }
+  const payload: Record<string, unknown> = {
+    type: params.type,
+    url: params.url,
+  };
+  // Image(=2) needs width/height/name/size; File(=8) needs name/size.
+  if (params.type === MessageType.Image) {
+    if (params.width) payload.width = params.width;
+    if (params.height) payload.height = params.height;
+    if (params.name) payload.name = params.name;
+    if (params.size != null) payload.size = params.size;
+  } else {
+    if (params.name) payload.name = params.name;
+    if (params.size != null) payload.size = params.size;
+  }
+  if (
+    (params.mentionUids && params.mentionUids.length > 0) ||
+    (params.mentionEntities && params.mentionEntities.length > 0)
+  ) {
+    const mention: Record<string, unknown> = {};
+    if (params.mentionUids && params.mentionUids.length > 0) {
+      mention.uids = params.mentionUids;
+    }
+    if (params.mentionEntities && params.mentionEntities.length > 0) {
+      mention.entities = params.mentionEntities;
+    }
+    payload.mention = mention;
+  }
+  return await postJson<SendMessageResult>(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload,
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+  }, params.signal);
+}
+
+/**
+ * Send a RichText(=14) mixed text+image message to a channel.
+ *
+ * A single payload carries an ordered `content` array of {@link RichTextBlock}
+ * (array order = visual interleave order), so an image + caption lands as ONE
+ * message instead of a text send followed by a media send. Contract (octo-lib
+ * richtext.go): `content` is required + non-empty; a text block's `text` must be
+ * non-empty; an image block's `url` must be http/https with width/height > 0.
+ * The caller assembles + validates blocks; the server is authoritative. `plain`
+ * is an optional degraded-client fallback the server reauthors from `content`.
+ */
+export async function sendRichTextMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  blocks: RichTextBlock[];
+  plain?: string;
+  mentionUids?: string[];
+  mentionEntities?: MentionEntity[];
+  mentionAll?: boolean;
+  replyMsgId?: string;
+  clientMsgNo?: string;
+  signal?: AbortSignal;
+}): Promise<SendMessageResult | undefined> {
+  if (!params.channelId || !params.channelId.trim()) {
+    throw new Error("octo: channelId is required to send a rich text message");
+  }
+  if (!Array.isArray(params.blocks) || params.blocks.length === 0) {
+    throw new Error("octo: sendRichTextMessage requires a non-empty blocks array");
+  }
+  const payload: Record<string, unknown> = {
+    type: MessageType.RichText,
+    content: params.blocks,
+  };
+  if (typeof params.plain === "string") {
+    payload.plain = params.plain;
+  }
   if (
     (params.mentionUids && params.mentionUids.length > 0) ||
     (params.mentionEntities && params.mentionEntities.length > 0) ||
