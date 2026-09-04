@@ -245,6 +245,19 @@ export interface Config {
      */
     displayCard?: boolean;
     /**
+     * C1/C2/C3: when true, give the agent an in-process `send_media` MCP tool set
+     * (`octo_send_media` for one image/file, `octo_send_rich_text` for a mixed
+     * text+image RichText message) to post rich media to the CURRENT session's
+     * channel. cc's StreamRelay only sends text; this adds the "send an
+     * image/file" path. Uploads go through the backend-agnostic presigned PUT
+     * (MinIO/COS/S3/OSS). The delivery target comes from the trusted per-turn
+     * session coords, never from tool arguments, and media is always sent as the
+     * bot's own identity (no OBO). Local sources are confined to the session cwd
+     * sandbox; http(s) sources are SSRF-guarded; all sources are size-capped.
+     * Default off. Per-bot.
+     */
+    sendMedia?: boolean;
+    /**
      * External MCP servers exposed to the agent, keyed by server name (tools
      * surface as `mcp__<name>__<tool>`). Merged with any in-process servers cc
      * injects per turn (cron, GROUP.md write-back) — a name clash lets those

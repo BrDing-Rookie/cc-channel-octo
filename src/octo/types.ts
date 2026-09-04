@@ -222,6 +222,33 @@ export const RICH_TEXT_BLOCK_IMAGE = "image";
 /** Placeholder rendered for an inline image when assembling plain text. */
 export const RICH_TEXT_IMAGE_PLACEHOLDER = '[图片]';
 
+/**
+ * A single block of a RichText(=14) `content` array. Array order IS the visual
+ * text/image interleave order.
+ *   - type=text  → uses `text` (plain text; MVP does not render markdown).
+ *   - type=image → uses `url` / `width` / `height` (`size`, `name` optional).
+ *
+ * ⚠️ Naming is locked to the octo-lib `richtext.go` contract: an image block
+ * MUST carry width/height > 0 and an http/https `url`; a text block's `text`
+ * must be non-empty. This adapter only assembles blocks — the server is the
+ * authoritative validator. Never use entities + offset/length here.
+ */
+export interface RichTextBlock {
+  type: typeof RICH_TEXT_BLOCK_TEXT | typeof RICH_TEXT_BLOCK_IMAGE | string;
+  /** text block content (required + non-empty when type=text). */
+  text?: string;
+  /** image block address (required when type=image; scheme http/https only). */
+  url?: string;
+  /** image block width in px (contract: required + > 0, avoids layout jitter). */
+  width?: number;
+  /** image block height in px (contract: required + > 0). */
+  height?: number;
+  /** image block byte size (optional). */
+  size?: number;
+  /** image block original filename (optional). */
+  name?: string;
+}
+
 // ─── Forward-payload nested message (MultipleForward children) ──────────────
 
 export interface ForwardUser {

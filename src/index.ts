@@ -40,6 +40,11 @@ import {
   type DisplayCardSessionCoords,
 } from './card-display-tool.js';
 import {
+  createMediaSendToolServer,
+  MEDIA_SEND_TOOL_SERVER_NAME,
+  type MediaSendSessionCoords,
+} from './media-send-tool.js';
+import {
   createGroupMdToolServer,
   GROUP_MD_TOOL_SERVER_NAME,
   createThreadMdToolServer,
@@ -942,6 +947,28 @@ export async function handleMessage(
         sessionOpts = {
           ...(sessionOpts ?? {}),
           mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [DISPLAY_CARD_TOOL_SERVER_NAME]: displayCardServer },
+        };
+      }
+
+      // C1/C2/C3: when send-media is on, inject the media-send MCP tool set bound
+      // to THIS session's channel coords + cwd sandbox (a sent image/file lands
+      // here; local sources resolve relative to this cwd and stay inside it) and
+      // the bot's own wire credentials (identity is always bot; no OBO from model
+      // input). Uploads go through the backend-agnostic presigned PUT. Per-turn
+      // server because the delivery channel + cwd differ per message.
+      if (config.sdk.sendMedia && config.botToken && config.apiUrl) {
+        const coords: MediaSendSessionCoords = {
+          channelId,
+          channelType,
+          cwdDir: resolveSessionCwd(config.cwdBase ?? config.cwd, sessionCtx),
+        };
+        const mediaSendServer = createMediaSendToolServer(
+          { apiUrl: config.apiUrl, botToken: config.botToken },
+          coords,
+        );
+        sessionOpts = {
+          ...(sessionOpts ?? {}),
+          mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [MEDIA_SEND_TOOL_SERVER_NAME]: mediaSendServer },
         };
       }
 
