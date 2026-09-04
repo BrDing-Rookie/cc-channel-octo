@@ -132,6 +132,82 @@ export enum MessageType {
   MultipleForward = 11,
   /** Rich text (text + inline images), introduced in upstream v1.0.x */
   RichText = 14,
+  /**
+   * Interactive card (Adaptive Cards 1.5). InteractiveCard(17) ≠ common Card(7);
+   * new card logic must target 17, never 7 (octo-server PR #525 P1).
+   */
+  InteractiveCard = 17,
+}
+
+/**
+ * InteractiveCard(=17) protocol profile / version (octo-server Decision 10
+ * negotiated values). A display card defaults to `octo/v1`; a card carrying any
+ * `Input.*` / `Action.Submit` is upgraded to `octo/v2`. `card_version` is fixed
+ * at `1.5` — a non-`octo/v1`+`1.5` combination is rejected server-side with 400.
+ */
+export const CARD_PROFILE = "octo/v1";
+export const CARD_INTERACTIVE_PROFILE = "octo/v2";
+export const CARD_VERSION = "1.5";
+export type CardProfile = typeof CARD_PROFILE | typeof CARD_INTERACTIVE_PROFILE;
+
+/**
+ * A single candidate returned by the name → target resolver
+ * (GET /v1/bot/resolve/targets, octo-server PR #337).
+ *
+ * Group candidates carry only the group identity; thread candidates additionally
+ * carry `shortId` + `parentName`. There is no `parentGroupNo` — `groupNo` already
+ * holds the parent group for a thread.
+ */
+export interface TargetCandidate {
+  kind: "group" | "thread";
+  /** group: group_no ; thread: group_no____short_id (four underscores). */
+  channelId: string;
+  /** 2 = group, 5 = thread (CommunityTopic). */
+  channelType: ChannelType;
+  name: string;
+  groupNo: string;
+  /** Thread only. */
+  shortId?: string;
+  /** Thread only. */
+  parentName?: string;
+}
+
+/**
+ * A typed bot event returned by GET /v1/bot/events (octo-server card-action
+ * callback queue). The gateway's poll loop reads `event_id` as the cursor and
+ * dispatches on `event_type` / `event_data`; the wire shape is intentionally
+ * permissive because the queue carries several event families.
+ */
+export interface BotEvent {
+  event_id: number;
+  event_type?: string;
+  event_data?: Record<string, unknown>;
+  message?: Record<string, unknown>;
+}
+
+/**
+ * The authoritative set of renderer capabilities derived from the server card
+ * profile manifest (see api.ts `getCardProfile` / `deriveCardCaps`). All fields
+ * are optional: an absent field means "the server did not advertise this axis",
+ * which consumers treat as a conservative baseline (fail-closed).
+ */
+export interface CardCaps {
+  /** Server-advertised element whitelist (pkg/cardmsg authoritative). */
+  elements?: ReadonlySet<string>;
+  /** Server-advertised input whitelist (Input.Text/Toggle/ChoiceSet/Number/Date/Time). */
+  inputs?: ReadonlySet<string>;
+  /** Server-advertised local/navigation actions; interactive builders derive Submit from the octo/v2 profile. */
+  actions?: ReadonlySet<string>;
+  /** Max recursive node count (limits.max_nodes). */
+  maxNodes?: number;
+  /** Max rendered-JSON object depth (limits.max_depth). */
+  maxDepth?: number;
+  /** Max UTF-8 byte size of the full type-17 payload (limits.max_payload_bytes). */
+  maxPayloadBytes?: number;
+  /** Max UTF-8 byte size of a single Input.Text value (limits.max_input_text_bytes). */
+  maxInputTextBytes?: number;
+  /** Max UTF-8 byte size of the serialized inputs map (limits.max_inputs_bytes). */
+  maxInputsBytes?: number;
 }
 
 /**
