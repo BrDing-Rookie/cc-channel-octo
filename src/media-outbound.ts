@@ -306,11 +306,45 @@ const DATA_URI_EXT: Record<string, string> = {
 };
 
 /**
+ * Byte-level percent-decode a `data:` URI body per RFC 2397/3986.
+ *
+ * `%HH` → the raw byte 0xHH (NOT a UTF-8 code point); any other run of
+ * characters is emitted as its UTF-8 bytes. This is deliberately NOT
+ * `decodeURIComponent`, which is character-level and throws on octet sequences
+ * that aren't valid UTF-8 — so a legitimate non-UTF-8 body like
+ * `data:text/plain;charset=iso-8859-7,%be` or `data:application/octet-stream,%FF`
+ * would be wrongly rejected (review R1 #4 follow-up). A backend-agnostic media
+ * path must be byte-exact. Throws only on a genuinely malformed `%` escape.
+ */
+function percentDecodeToBytes(s: string): Buffer {
+  const chunks: Buffer[] = [];
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '%') {
+      const hex = s.slice(i + 1, i + 3);
+      if (hex.length !== 2 || !/^[0-9a-fA-F]{2}$/.test(hex)) {
+        throw new Error('data URI 百分号编码非法');
+      }
+      chunks.push(Buffer.from([parseInt(hex, 16)]));
+      i += 3;
+    } else {
+      // Accumulate the literal run up to the next '%' and emit it as UTF-8.
+      let j = i;
+      while (j < s.length && s[j] !== '%') j++;
+      chunks.push(Buffer.from(s.slice(i, j), 'utf-8'));
+      i = j;
+    }
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
  * Decode the body of a `data:` URI per RFC 2397.
  *
  * `data:[<mediatype>][;base64],<data>` — only the `;base64` form is base64; the
- * default form is percent-encoded text (previously this silently base64-decoded
- * BOTH, turning `data:text/plain,hello%20world` into garbage — review R1 #4).
+ * default form is percent-encoded BYTES (decoded byte-exact, see
+ * {@link percentDecodeToBytes}; previously this silently base64-decoded BOTH,
+ * turning `data:text/plain,hello%20world` into garbage — review R1 #4).
  */
 function decodeDataUri(src: string, maxBytes: number, filenameHint?: string): ResolvedMedia {
   const comma = src.indexOf(',');
@@ -334,15 +368,9 @@ function decodeDataUri(src: string, maxBytes: number, filenameHint?: string): Re
     }
     buf = Buffer.from(trimmed, 'base64');
   } else {
-    // Percent-encoded text. The decoded byte length is bounded by the source
-    // length we already hold (no amplification), so decode then check.
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(data);
-    } catch {
-      throw new Error('data URI 百分号编码非法');
-    }
-    buf = Buffer.from(decoded, 'utf-8');
+    // Percent-encoded bytes (RFC 2397). The decoded length is bounded by the
+    // source length we already hold (no amplification), so decode then check.
+    buf = percentDecodeToBytes(data);
   }
   if (buf.length > maxBytes) {
     throw new Error(`媒体超过大小上限 ${maxBytes} 字节 (${buf.length} 字节)`);

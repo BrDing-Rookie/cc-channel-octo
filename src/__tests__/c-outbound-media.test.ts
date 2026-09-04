@@ -412,5 +412,32 @@ describe('resolveMediaSource — data URI decoding (R1 #4)', () => {
       resolveMediaSource({ source: 'data:text/plain,bad%ZZ', cwdDir: cwd, ...BASE }),
     ).rejects.toThrow(/百分号编码非法/);
   });
+
+  it('byte-decodes a non-UTF-8 octet (iso-8859-7 %be) instead of rejecting it', async () => {
+    // %be is a valid single byte in iso-8859-7 but not valid UTF-8 — the old
+    // decodeURIComponent path threw; byte-level decode must keep the raw byte.
+    const r = await resolveMediaSource({
+      source: 'data:text/plain;charset=iso-8859-7,%be', cwdDir: cwd, ...BASE,
+    });
+    expect(Array.from(r.fileBuffer!)).toEqual([0xbe]);
+    expect(r.fileSize).toBe(1);
+    expect(r.contentType).toBe('text/plain');
+    await disposeResolvedMedia(r);
+  });
+
+  it('byte-decodes an arbitrary binary octet (application/octet-stream %FF)', async () => {
+    const r = await resolveMediaSource({
+      source: 'data:application/octet-stream,%FF', cwdDir: cwd, ...BASE,
+    });
+    expect(Array.from(r.fileBuffer!)).toEqual([0xff]);
+    expect(r.contentType).toBe('application/octet-stream');
+    await disposeResolvedMedia(r);
+  });
+
+  it('mixes literal ASCII runs and percent-escaped bytes byte-exactly', async () => {
+    const r = await resolveMediaSource({ source: 'data:application/octet-stream,AB%00%FFYZ', cwdDir: cwd, ...BASE });
+    expect(Array.from(r.fileBuffer!)).toEqual([0x41, 0x42, 0x00, 0xff, 0x59, 0x5a]);
+    await disposeResolvedMedia(r);
+  });
 });
 
