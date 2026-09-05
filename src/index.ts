@@ -16,6 +16,13 @@ import { OctoGateway } from './gateway.js';
 import { SessionRouter } from './session-router.js';
 import { GroupContext } from './group-context.js';
 import { queryAgent } from './agent-bridge.js';
+import type { AgentStreamEvent } from './agent-bridge.js';
+import {
+  setCardContext,
+  handleAgentEvent,
+  finalizeCard,
+  resolveProgressCardCaps,
+} from './card-progress.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import { sanitizeDisplayName, escapeSectionMarkers, sanitizePromptBody, formatSenderLabel } from './prompt-safety.js';
 import type { SessionCtx } from './cwd-resolver.js';
@@ -518,6 +525,8 @@ export async function handleMessage(
   const routeResult = await router.routeAndHandle(msg, async (result) => {
     wasProcessed = true;
     const { sessionKey } = result;
+    // A6: declared outside the try so the catch can settle the progress card too.
+    let progressCardOn = false;
 
     try {
       // --- Session ---
@@ -929,6 +938,26 @@ export async function handleMessage(
         };
       }
 
+      // A6: progress card — a single live InteractiveCard(=17) state machine per
+      // turn (thinking / tool / answering / done), driven off the SDK query()
+      // stream via onAgentEvent. Gated on the server D12 profile advertising
+      // display_enabled (resolveProgressCardCaps is fail-closed). Independent of
+      // the lighter `toolProgress` text notices; both may be on.
+      if (config.sdk.progressCard && config.botToken && config.apiUrl) {
+        const { enabled, caps } = await resolveProgressCardCaps(config.apiUrl, config.botToken);
+        if (enabled) {
+          progressCardOn = true;
+          setCardContext(sessionKey, {
+            apiUrl: config.apiUrl,
+            botToken: config.botToken,
+            channelId,
+            channelType,
+            ...(caps ? { caps } : {}),
+            ...(config.sdk.showReasoning ? { showReasoning: true } : {}),
+          });
+        }
+      }
+
       // Always resume the SDK session for this sessionKey: the SDK session owns
       // the conversation history (across turns and, for groups, across speakers —
       // the speaker is encoded in each turn so attribution survives). `resume` was
@@ -938,7 +967,7 @@ export async function handleMessage(
       // queryAgent recovers by calling onResumeFailed (clear the bad id) and
       // retrying once with the pre-assembled fallbackRetryPrompt so the
       // conversation isn't lost (and assembly happens exactly once — see above).
-      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean } | undefined = {
+      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; onAgentEvent?: (event: AgentStreamEvent) => void } | undefined = {
         ...(resume ? { resume } : {}),
         onSessionId: (id: string) => store.setSdkSessionId(sessionKey, id),
         ...(resume
@@ -948,6 +977,14 @@ export async function handleMessage(
             }
           : {}),
       };
+
+      // A6: forward SDK stream events to the progress-card state machine.
+      if (progressCardOn) {
+        sessionOpts = {
+          ...(sessionOpts ?? {}),
+          onAgentEvent: (event: AgentStreamEvent) => handleAgentEvent(sessionKey, event),
+        };
+      }
 
       // Persistent Skill paths are disclosed only to the registered owner in a
       // DM. Group sessions are shared, so exposing them there would persist the
@@ -1220,7 +1257,19 @@ export async function handleMessage(
         });
       }
 
+      // A6: settle the progress card into its terminal (done) frame.
+      if (progressCardOn) {
+        await finalizeCard(sessionKey, { success: true });
+      }
+
     } catch (err) {
+      // A6: settle the progress card into its terminal (error) frame before the
+      // user-facing error reply.
+      if (progressCardOn) {
+        await finalizeCard(sessionKey, { success: false, errorText: String(err) }).catch(() => {
+          /* finalize is best-effort; never mask the original error */
+        });
+      }
       console.error(`[cc-channel-octo] Error processing message (session=${result.sessionKey}):`, String(err));
       // #115: attribute a FAILED cron fire to its task. handleMessage swallows
       // errors here (it sends a user-facing reply, never rethrows), so the
