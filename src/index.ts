@@ -50,6 +50,11 @@ import {
   type OctoMessageSessionCoords,
 } from './octo-message-tool.js';
 import {
+  createOctoManagementToolServer,
+  OCTO_MANAGEMENT_TOOL_SERVER_NAME,
+  type OctoManagementSessionCoords,
+} from './octo-management-tool.js';
+import {
   createInteractiveCardToolServer,
   INTERACTIVE_CARD_TOOL_SERVER_NAME,
   type InteractiveCardSessionCoords,
@@ -1093,6 +1098,24 @@ export async function handleMessage(
         sessionOpts = {
           ...(sessionOpts ?? {}),
           mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [OCTO_MESSAGE_TOOL_SERVER_NAME]: octoMessageServer },
+        };
+      }
+
+      // B1/B4–B7: group/thread/member discovery + owner-gated management tool.
+      // Per-turn server carrying the requester + owner uid; mutating actions are
+      // limited to the owner and audited. Gated behind sdk.octoManagement (off).
+      if (config.sdk.octoManagement && config.botToken && config.apiUrl) {
+        const coords: OctoManagementSessionCoords = {
+          requesterUid: msg.from_uid ?? '',
+          ownerUid: router.getOwnerUid(),
+        };
+        const octoManagementServer = createOctoManagementToolServer(
+          { apiUrl: config.apiUrl, botToken: config.botToken },
+          coords,
+        );
+        sessionOpts = {
+          ...(sessionOpts ?? {}),
+          mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [OCTO_MANAGEMENT_TOOL_SERVER_NAME]: octoManagementServer },
         };
       }
 
