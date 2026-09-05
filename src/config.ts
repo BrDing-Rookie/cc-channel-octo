@@ -280,6 +280,17 @@ export interface Config {
      */
     eventWaitSeconds?: number;
     /**
+     * B2/B3: when true, give the agent an in-process `octo_message` MCP tool
+     * (`octo_message`) with `send` / `read` actions to proactively post text to,
+     * or read recent history from, ANOTHER channel (not just the current one).
+     * A cross-channel send/read is authorized against the requesting human
+     * (owner / DM peer / group member), audited, and cross-channel reads are
+     * wrapped as untrusted data; outbound @mentions are sanitized against the
+     * target's members. Messages are always sent as the bot's own identity (no
+     * OBO). Default off. Per-bot — enable only for trusted-context bots.
+     */
+    octoMessage?: boolean;
+    /**
      * External MCP servers exposed to the agent, keyed by server name (tools
      * surface as `mcp__<name>__<tool>`). Merged with any in-process servers cc
      * injects per turn (cron, GROUP.md write-back) — a name clash lets those

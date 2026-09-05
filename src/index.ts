@@ -45,6 +45,11 @@ import {
   type MediaSendSessionCoords,
 } from './media-send-tool.js';
 import {
+  createOctoMessageToolServer,
+  OCTO_MESSAGE_TOOL_SERVER_NAME,
+  type OctoMessageSessionCoords,
+} from './octo-message-tool.js';
+import {
   createInteractiveCardToolServer,
   INTERACTIVE_CARD_TOOL_SERVER_NAME,
   type InteractiveCardSessionCoords,
@@ -1067,6 +1072,27 @@ export async function handleMessage(
         sessionOpts = {
           ...(sessionOpts ?? {}),
           mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [MEDIA_SEND_TOOL_SERVER_NAME]: mediaSendServer },
+        };
+      }
+
+      // B2/B3: proactive cross-channel message tool (send/read). Per-turn server
+      // carrying the current channel + the REQUESTER uid + the bot owner uid, so
+      // the tool can authorize + audit a cross-channel operation against the human
+      // who drove this turn. Gated behind sdk.octoMessage (default off).
+      if (config.sdk.octoMessage && config.botToken && config.apiUrl) {
+        const coords: OctoMessageSessionCoords = {
+          channelId,
+          channelType,
+          requesterUid: msg.from_uid ?? '',
+          ownerUid: router.getOwnerUid(),
+        };
+        const octoMessageServer = createOctoMessageToolServer(
+          { apiUrl: config.apiUrl, botToken: config.botToken },
+          coords,
+        );
+        sessionOpts = {
+          ...(sessionOpts ?? {}),
+          mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [OCTO_MESSAGE_TOOL_SERVER_NAME]: octoMessageServer },
         };
       }
 
