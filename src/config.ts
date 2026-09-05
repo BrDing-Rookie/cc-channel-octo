@@ -291,6 +291,17 @@ export interface Config {
      */
     octoMessage?: boolean;
     /**
+     * B1/B4–B7: when true, give the agent an in-process `octo_management` MCP
+     * tool (`octo_management`) — group/thread/member discovery (list-groups,
+     * shared-groups, group-info, group-members, resolve, list/get-thread,
+     * list-thread-members) plus owner-gated management (create/update-group,
+     * add/remove-members, create/delete-thread, join/leave-thread). Mutating
+     * actions are limited to the bot owner uid and audited; the server also
+     * requires a User Bot token for group/thread management. Default off.
+     * Per-bot — enable only for trusted-context bots.
+     */
+    octoManagement?: boolean;
+    /**
      * External MCP servers exposed to the agent, keyed by server name (tools
      * surface as `mcp__<name>__<tool>`). Merged with any in-process servers cc
      * injects per turn (cron, GROUP.md write-back) — a name clash lets those
