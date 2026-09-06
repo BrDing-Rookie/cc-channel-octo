@@ -18,6 +18,7 @@ import {
   synthesizeDocMentionMessage,
   type DocTaskContext,
 } from '../doc-mention.js';
+import { parseCardAction, synthesizeCardActionMessage } from '../card-action.js';
 
 const ROBOT_ID = 'bot-001';
 
@@ -85,6 +86,44 @@ describe('SessionRouter', () => {
     const u1 = makeMsg({ channel_type: ChannelType.DM, from_uid: 'u1' });
     const u2 = makeMsg({ channel_type: ChannelType.DM, from_uid: 'u2' });
     expect(router.sessionKey(u1)).not.toBe(router.sessionKey(u2));
+  });
+
+  // LOO-12: a DM card click must resume the SAME session the user is talking in.
+  // The server contract delivers card_action with a BARE operator_uid and a bare
+  // DM channel_id; the normal inbound DM path carries the compound from_uid
+  // `s{spaceId}_{peerId}` from which the session key is derived. This locks the
+  // cross-module invariant: synthesizeCardActionMessage → router.sessionKey must
+  // equal the key of a real inbound DM from the same peer in the same space.
+  it('DM card action synthesizes to the same session key as the real inbound DM', () => {
+    const SPACE = 'sp9';
+    const PEER = 'user-42';
+
+    // A real inbound DM from this peer: octo delivers from_uid compound.
+    const inboundDm = makeMsg({
+      channel_type: ChannelType.DM,
+      from_uid: `s${SPACE}_${PEER}`,
+      channel_id: `s${SPACE}_${PEER}@s${SPACE}_${ROBOT_ID}`,
+    });
+
+    // The same peer clicks a card in that DM: server sends bare operator_uid +
+    // bare channel_id, and the bot synthesizes the re-run message.
+    const action = parseCardAction({
+      event_id: 7,
+      event_type: 'card_action',
+      event_data: {
+        message_id: 'msg-1',
+        channel_id: PEER, // DM channel_id on the wire is the bare peer uid
+        channel_type: ChannelType.DM,
+        action_id: 'approve',
+        operator_uid: PEER, // BARE — c.GetLoginUID() on octo-server
+        space_id: SPACE,
+      },
+    })!;
+    const synthesized = synthesizeCardActionMessage(action, ROBOT_ID);
+
+    expect(router.sessionKey(synthesized)).toBe(router.sessionKey(inboundDm));
+    // And concretely: the space-aware key, not the bare-uid key it used to be.
+    expect(router.sessionKey(synthesized)).toBe(`${SPACE}:s${SPACE}_${PEER}`);
   });
 
   // --- Self-skip ---

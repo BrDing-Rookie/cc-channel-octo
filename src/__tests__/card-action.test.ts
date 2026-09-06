@@ -90,10 +90,21 @@ describe('synthesizeCardActionMessage', () => {
     expect(msg.message_id).toBe('card_action:7');
   });
 
-  it('reconstructs a space-aware DM channel id from operator + space', () => {
+  it('reconstructs a space-aware DM channel id and from_uid from operator + space', () => {
     const a = parseCardAction(event({ channel_type: ChannelType.DM, space_id: 'sp9', channel_id: 'user-42' }))!;
     const msg = synthesizeCardActionMessage(a, 'bot-1');
     expect(msg.channel_id).toBe('ssp9_user-42');
+    // from_uid must also be the compound form: the DM session key is derived from
+    // from_uid, so a bare uid here would route the click to a detached DM session
+    // (cross-module regression locked in session-router.test.ts).
+    expect(msg.from_uid).toBe('ssp9_user-42');
+  });
+
+  it('leaves from_uid/channel_id bare for a DM without a space id', () => {
+    const a = parseCardAction(event({ channel_type: ChannelType.DM, space_id: '', channel_id: 'user-42' }))!;
+    const msg = synthesizeCardActionMessage(a, 'bot-1');
+    expect(msg.channel_id).toBe('user-42');
+    expect(msg.from_uid).toBe('user-42');
   });
 
   it('keeps user input inside a JSON value, not interpolated as control text', () => {
