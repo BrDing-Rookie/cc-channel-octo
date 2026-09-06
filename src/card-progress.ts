@@ -434,6 +434,10 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         channelType: entry.ctx.channelType,
         card,
         plain,
+        // Progress frames own their own 429 handling here: a 429 opens the per-apiUrl
+        // cooldown window (classifyError → noteRateLimited) and the frame is held, not
+        // retried inside postJson — sleeping there would stall every frame behind it.
+        retryOn429: false,
         signal,
       });
       // Record the message_id when this entry is still the live card OR has entered
@@ -459,6 +463,8 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         plain,
         cardSeq: entry.nextCardSeq++,
         transient: true,
+        // See the send branch: 429 is handled by the cooldown gate, not postJson backoff.
+        retryOn429: false,
         signal,
       });
     }
@@ -560,6 +566,10 @@ async function deliverTerminal(entry: CardEntry): Promise<void> {
         channelType: entry.ctx.channelType,
         card,
         plain,
+        // The detached terminal frame runs its OWN cooldown-aware retry loop
+        // (scheduleTerminalRetry, MAX_TERMINAL_ATTEMPTS). Retrying inside postJson too
+        // would layer two backoffs; keep this the sole 429 handler for the terminal.
+        retryOn429: false,
         signal,
       });
       entry.messageId = res?.message_id;
@@ -579,6 +589,8 @@ async function deliverTerminal(entry: CardEntry): Promise<void> {
         plain,
         cardSeq: entry.nextCardSeq++,
         // Terminal frame is recorded (NOT transient) so it enters the revision history.
+        // 429 handling stays in this driver's own retry loop (see the send branch).
+        retryOn429: false,
         signal,
       });
     }
