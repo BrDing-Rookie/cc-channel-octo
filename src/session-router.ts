@@ -7,6 +7,7 @@ import type { BotMessage, MentionEntity } from './octo/types.js';
 import { ChannelType, MessageType } from './octo/types.js';
 import { sendMessage } from './octo/api.js';
 import { isAuthenticCronFire } from './cron-fire-marker.js';
+import { isAuthenticDocFire, DOC_TASK_PAYLOAD_KEY } from './doc-fire-marker.js';
 import { extractParentGroupNo, extractThreadShortId } from './octo/channel-id.js';
 import type { GroupMdCache, ThreadMdCache } from './group-md-cache.js';
 import { isGroupMdUpdateEvent, isThreadMdUpdateEvent } from './group-md-events.js';
@@ -263,6 +264,15 @@ export class SessionRouter {
   }
 
   sessionKey(msg: BotMessage): string {
+    // D1: a genuine doc-comment task is isolated PER COMMENT THREAD
+    // (`doctask:<docId>:<threadId>`), not by the (DM-shaped) sentinel channel or
+    // the commenter's uid — same-thread follow-ups share context, different
+    // threads do not. Honored only for an AUTHENTIC doc fire (nonce match); a
+    // forged inbound `_docTask` falls through to normal keying (hard gate #1).
+    if (isAuthenticDocFire(msg.payload)) {
+      const scope = (msg.payload[DOC_TASK_PAYLOAD_KEY] as { sessionScope?: unknown } | undefined)?.sessionScope;
+      if (typeof scope === 'string' && scope.trim()) return scope;
+    }
     const spaceId = this.extractSpaceId(msg);
     if (msg.channel_type === ChannelType.DM) {
       // DM is per-user (private): same peer always resumes the same session.

@@ -34,6 +34,7 @@ import {
   MIN_EVENT_WAIT_SECONDS,
 } from './octo/api.js';
 import { parseCardAction, type CardAction } from './card-action.js';
+import { parseDocCommentMention, type DocCommentMention } from './doc-mention.js';
 
 const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_LIMIT = 50;
@@ -86,6 +87,13 @@ export interface EventPollerOptions {
   botToken: string;
   cursorStore: EventCursorStore;
   onCardAction?: (action: CardAction) => void | Promise<void>;
+  /**
+   * D1: routed a `doc_comment_mention` event. Like `onCardAction`, awaited
+   * serially and allowed to throw (cursor not advanced/acked → bounded replay);
+   * in practice the doc-mention handler never throws (it owns its own dedupe /
+   * dead-letter), so a resolved call is safe to ack.
+   */
+  onDocMention?: (mention: DocCommentMention) => void | Promise<void>;
   intervalMs?: number;
   limit?: number;
   /**
@@ -223,6 +231,7 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
         options.log?.error?.(`octo: event poll dropped ${malformed} event(s) with a non-integer event_id`);
       }
       let cardActions = 0;
+      let docMentions = 0;
       const ordered = events
         .filter((event) => Number.isSafeInteger(event.event_id) && event.event_id > cursor)
         .sort((a, b) => a.event_id - b.event_id);
@@ -236,6 +245,19 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
           // 卡片动作**故意**让异常逃出去:不存游标、不 ack,下一轮重取同一事件。重放次数由
           // card-session 的 per-event dispatchAttempts 计数封顶,不会无限循环。
           await options.onCardAction!(action);
+        }
+
+        // D1 doc-comment mention. Mutually exclusive with card_action (distinct
+        // event_type), so a card event never parses here and vice versa. Awaited
+        // serially — a doc task edits a document, so overlapping runs on the same
+        // thread must not race (see doc-mention.ts / dedupe rationale).
+        if (!recognized && options.onDocMention) {
+          const mention = parseDocCommentMention(event);
+          if (mention) {
+            recognized = true;
+            docMentions += 1;
+            await options.onDocMention(mention);
+          }
         }
 
         // 落盘游标**排在 ack 之前**:进程崩溃最坏是重放一次动作,绝不会 ack 掉一个本地已经忘掉
@@ -271,7 +293,7 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       outcome = ordered.length > 0 ? 'batch' : 'empty';
       if (events.length > 0) {
         options.log?.info?.(
-          `octo: event poll batch events=${events.length} card_actions=${cardActions} cursor=${cursor}`,
+          `octo: event poll batch events=${events.length} card_actions=${cardActions} doc_mentions=${docMentions} cursor=${cursor}`,
         );
       }
     } catch (error) {
