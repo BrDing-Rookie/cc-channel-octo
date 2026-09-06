@@ -67,6 +67,11 @@ import {
   type OctoManagementSessionCoords,
 } from './octo-management-tool.js';
 import {
+  createOctoSecretToolServer,
+  OCTO_SECRET_TOOL_SERVER_NAME,
+  type OctoSecretSessionCoords,
+} from './octo-secret-tool.js';
+import {
   createInteractiveCardToolServer,
   INTERACTIVE_CARD_TOOL_SERVER_NAME,
   type InteractiveCardSessionCoords,
@@ -1256,6 +1261,28 @@ export async function handleMessage(
         sessionOpts = {
           ...(sessionOpts ?? {}),
           mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [OCTO_MANAGEMENT_TOOL_SERVER_NAME]: octoManagementServer },
+        };
+      }
+
+      // B10: write-secret tool. Per-turn server carrying the requester + owner
+      // uid (owner-gated + audited) and THIS session's cwd sandbox as the FS-jail
+      // root (an explicit sdk.secretsFileRoot wins over it). Resolves the owner's
+      // stored secret and writes the plaintext into a jailed file; the plaintext
+      // never enters the tool args/result. Gated behind sdk.octoSecret (off).
+      if (config.sdk.octoSecret && config.botToken && config.apiUrl) {
+        const coords: OctoSecretSessionCoords = {
+          channelId,
+          requesterUid: msg.from_uid ?? '',
+          ownerUid: router.getOwnerUid(),
+          cwdDir: resolveSessionCwd(config.cwdBase ?? config.cwd, sessionCtx),
+        };
+        const octoSecretServer = createOctoSecretToolServer(
+          { apiUrl: config.apiUrl, botToken: config.botToken, secretsFileRoot: config.sdk.secretsFileRoot },
+          coords,
+        );
+        sessionOpts = {
+          ...(sessionOpts ?? {}),
+          mcpServers: { ...(sessionOpts?.mcpServers ?? {}), [OCTO_SECRET_TOOL_SERVER_NAME]: octoSecretServer },
         };
       }
 
