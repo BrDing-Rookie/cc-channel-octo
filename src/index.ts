@@ -22,6 +22,8 @@ import {
   handleAgentEvent,
   finalizeCard,
   markStopped,
+  reserveTurn,
+  isCurrentTurn,
   resolveProgressCardCaps,
 } from './card-progress.js';
 import type { CardHandle } from './card-progress.js';
@@ -532,6 +534,19 @@ export async function handleMessage(
     // A6: turn-level handle for the progress card; fences every event/finalize/stop
     // to THIS turn's generation (a superseded turn no-ops against the new card).
     let cardHandle: CardHandle | undefined;
+    // A6 (round-2 fix #1): claim this turn's logical ordering token SYNCHRONOUSLY —
+    // before any await in the async prelude (member refresh / attachments / history /
+    // profile probe) that precedes setCardContext. A later turn on this session can
+    // only start after our dispatch timeout releases the lock, so it always reserves
+    // a higher token; if we time out and resume after it, isCurrentTurn is false and
+    // we must NOT install a card (that would clobber the live turn). onDispatchTimeout
+    // is registered here too so a timeout DURING the prelude is still observed.
+    const turnToken = reserveTurn(sessionKey);
+    let dispatchTimedOut = false;
+    result.onDispatchTimeout = () => {
+      dispatchTimedOut = true;
+      if (cardHandle) markStopped(cardHandle);
+    };
 
     try {
       // --- Session ---
@@ -950,7 +965,11 @@ export async function handleMessage(
       // the lighter `toolProgress` text notices; both may be on.
       if (config.sdk.progressCard && config.botToken && config.apiUrl) {
         const { enabled, caps } = await resolveProgressCardCaps(config.apiUrl, config.botToken);
-        if (enabled) {
+        // Round-2 fix #1: only install if THIS turn is still the session's latest and
+        // has not already timed out. A zombie turn (timed out during the prelude, then
+        // resumed after a newer turn started) would otherwise call setCardContext with
+        // a higher generation and skip/replace the live turn's card.
+        if (enabled && !dispatchTimedOut && isCurrentTurn(sessionKey, turnToken)) {
           progressCardOn = true;
           cardHandle = setCardContext(sessionKey, {
             apiUrl: config.apiUrl,
@@ -960,12 +979,6 @@ export async function handleMessage(
             ...(caps ? { caps } : {}),
             ...(config.sdk.showReasoning ? { showReasoning: true } : {}),
           });
-          // #141 + A6: if the dispatch times out, the SDK stream keeps running in
-          // the background (session-router does not cancel it) — settle THIS turn's
-          // card into "stopped" so it isn't left spinning. Fenced by generation, so
-          // a later turn's card is untouched.
-          const stopHandle = cardHandle;
-          result.onDispatchTimeout = () => markStopped(stopHandle);
         }
       }
 

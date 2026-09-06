@@ -14,6 +14,8 @@ import {
   handleAgentEvent,
   finalizeCard,
   markStopped,
+  reserveTurn,
+  isCurrentTurn,
   resolveProgressCardCaps,
   _resetProgressCardsForTests,
   _resetProgressCapsCacheForTests,
@@ -190,19 +192,25 @@ describe("terminal-state correctness", () => {
     await vi.advanceTimersByTimeAsync(900);
     expect(sendCardMessage).toHaveBeenCalledTimes(1);
 
-    // Dispatch timeout marks the turn stopped; the background stream keeps going.
+    editCardMessage.mockClear();
+    // Dispatch timeout marks the turn stopped; the stopped terminal is delivered on
+    // the independent lifecycle (recorded, non-transient) right away — no cooldown.
     markStopped(h);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(editCardMessage).toHaveBeenCalledTimes(1);
+    const stopped = editCardMessage.mock.calls.at(-1)![0];
+    expect(stopped.transient).toBeUndefined();
+    expect(String(stopped.plain)).toContain("Stopped");
+    expect(String(stopped.plain)).not.toContain("Done");
+
+    // Intake is frozen: the background stream's late events produce no further sends,
+    // and the still-running handler's finalize no-ops (the entry is detached).
     editCardMessage.mockClear();
     handleAgentEvent(h, { kind: "tool_start", name: "LateTool", input: {}, id: "t2" });
     handleAgentEvent(h, { kind: "text" });
     await vi.advanceTimersByTimeAsync(900);
-
-    // The eventual finalize records a stopped terminal, not done.
     await finalizeCard(h, { success: true });
-    const last = editCardMessage.mock.calls.at(-1)![0];
-    expect(last.transient).toBeUndefined();
-    expect(String(last.plain)).toContain("Stopped");
-    expect(String(last.plain)).not.toContain("Done");
+    expect(editCardMessage).not.toHaveBeenCalled();
   });
 });
 
@@ -250,6 +258,76 @@ describe("terminal frame honors the 429 cooldown", () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(editCardMessage).toHaveBeenCalledTimes(1);
     expect(editCardMessage.mock.calls[0][0].transient).toBeUndefined();
+  });
+});
+
+describe("round-2 combination timing", () => {
+  it("reserveTurn/isCurrentTurn: a zombie turn that resumes after a newer turn is no longer current", () => {
+    // Turn 1 reserves, then (dispatch timeout) a newer turn reserves the same session.
+    const t1 = reserveTurn("z");
+    const t2 = reserveTurn("z");
+    // The newer reservation wins; the zombie turn 1 must decline to install its card.
+    expect(isCurrentTurn("z", t1)).toBe(false);
+    expect(isCurrentTurn("z", t2)).toBe(true);
+    // A never-current empty-key token.
+    expect(isCurrentTurn("", reserveTurn(""))).toBe(false);
+  });
+
+  it("a superseding turn cannot cancel a stopped terminal that is waiting out a 429 cooldown", async () => {
+    const h1 = setCardContext("cx1", CTX);
+    handleAgentEvent(h1, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1); // m1
+
+    // A mid-frame edit is 429'd → opens the cooldown window.
+    editCardMessage.mockRejectedValueOnce(new Error("Octo API /v1/bot/editMessage failed (429): slow down"));
+    handleAgentEvent(h1, { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
+    await vi.advanceTimersByTimeAsync(900);
+    editCardMessage.mockClear();
+
+    // Dispatch timeout → stopped. Delivery is HELD by the open cooldown window.
+    markStopped(h1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(editCardMessage).not.toHaveBeenCalled();
+
+    // Immediate retry: a new turn starts on the SAME session and sends its own card.
+    sendCardMessage.mockResolvedValueOnce({ message_id: "m2" });
+    const h2 = setCardContext("cx1", CTX);
+    handleAgentEvent(h2, { kind: "tool_start", name: "Bash", input: {}, id: "t3" });
+    await vi.advanceTimersByTimeAsync(900);
+
+    // Window clears → turn 1's stopped terminal STILL lands on m1 (not cancelled by h2).
+    await vi.advanceTimersByTimeAsync(30_000);
+    const stoppedEdit = editCardMessage.mock.calls.find((c) => c[0].messageId === "m1");
+    expect(stoppedEdit).toBeDefined();
+    expect(stoppedEdit![0].transient).toBeUndefined();
+    expect(String(stoppedEdit![0].plain)).toContain("Stopped");
+  });
+
+  it("a new turn within the 429 window does not drop the previous turn's recorded terminal", async () => {
+    const h1 = setCardContext("cx2", CTX);
+    handleAgentEvent(h1, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1); // m1
+
+    // finalize's terminal edit is 429'd → held for retry (detached, independent).
+    editCardMessage.mockRejectedValueOnce(new Error("Octo API /v1/bot/editMessage failed (429): slow down"));
+    handleAgentEvent(h1, { kind: "tool_end", id: "t1", isError: false });
+    await finalizeCard(h1, { success: true });
+    expect(editCardMessage).toHaveBeenCalledTimes(1); // the rejected terminal attempt
+    editCardMessage.mockClear();
+
+    // A new turn starts on the same session WHILE the cooldown window is still open.
+    sendCardMessage.mockResolvedValue({ message_id: "m2" });
+    const h2 = setCardContext("cx2", CTX);
+    handleAgentEvent(h2, { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
+    await vi.advanceTimersByTimeAsync(900);
+
+    // Window clears → turn 1's recorded terminal is retried on m1 (not dropped by h2).
+    await vi.advanceTimersByTimeAsync(30_000);
+    const termEdit = editCardMessage.mock.calls.find((c) => c[0].messageId === "m1");
+    expect(termEdit).toBeDefined();
+    expect(termEdit![0].transient).toBeUndefined();
   });
 });
 
