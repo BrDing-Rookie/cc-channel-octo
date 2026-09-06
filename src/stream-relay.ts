@@ -16,6 +16,7 @@ import {
   sendMessage,
 } from "./octo/api.js";
 import { resolveMentions } from "./mention-utils.js";
+import { isDocTaskNonRoutableTarget } from "./doc-task-scope.js";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -167,6 +168,19 @@ export class StreamRelay {
     memberMap?: Map<string, string>,
     isValidUid?: (uid: string) => boolean,
   ): Promise<void> {
+    // D3 belt-and-suspenders (architect hard gate #2). A doc-task turn must be
+    // forked to the doc-comment sink in handleMessage and never reach here — its
+    // channel id is the non-routable sentinel. The main response path does NOT
+    // run through parseTarget, so if a future refactor drops the fork, this is
+    // the last line: fail LOUD instead of silently sendMessage-ing document
+    // content to a bogus (or, if the sentinel ever became routable, wrong) IM
+    // target. Normal channels are unaffected.
+    if (isDocTaskNonRoutableTarget(channelId)) {
+      throw new Error(
+        "octo: stream-relay refused a document-task session channel — a doc task's reply must go to " +
+          "the comment thread via postDocReply, never IM. This is a fork bug in handleMessage, not a config issue.",
+      );
+    }
     // --- Typing heartbeat ---
     const typingParams = { apiUrl, botToken, channelId, channelType };
     // Fire one immediately — don't wait for the first interval tick.

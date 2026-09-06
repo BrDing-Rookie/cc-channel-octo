@@ -81,6 +81,11 @@ import {
   startEventPoller,
   type EventPoller,
 } from './card-events-poll.js';
+import { isAuthenticDocFire, DOC_TASK_PAYLOAD_KEY } from './doc-fire-marker.js';
+import { type DocCommentMention, type DocTaskContext } from './doc-mention.js';
+import { createDocMentionHandler } from './doc-mention-handler.js';
+import { createFileDocMentionDedupeStore } from './doc-mention-dedupe.js';
+import { createFileDocTaskDeadLetterStore } from './doc-task-deadletter.js';
 import {
   createGroupMdToolServer,
   GROUP_MD_TOOL_SERVER_NAME,
@@ -414,7 +419,7 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
     // handler, whose `dispatch` re-runs the click as a normal turn — synthesizing a
     // BotMessage from the verified action and driving the SAME handleMessage
     // pipeline as real inbound / cron messages (no bespoke session/concurrency).
-    if (config.sdk.sendCard && config.botToken && config.apiUrl && config.botId) {
+    if ((config.sdk.sendCard || config.sdk.docMention) && config.botToken && config.apiUrl && config.botId) {
       const apiUrl = config.apiUrl;
       const botToken = config.botToken;
       const accountId = config.botId;
@@ -423,41 +428,83 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
         info: (m: string): void => console.log(`[cc-channel-octo] ${label}${m}`),
         error: (m: string): void => console.error(`[cc-channel-octo] ${label}${m}`),
       };
-      // Re-run one verified card click as a normal turn. handleMessage owns routing,
-      // the per-session lock, and error handling; it resolves void on completion. A
-      // throw escapes to the A8 handler, which treats it as transient (bounded replay
-      // via the per-event attempt counter). During drain we drop the click (rejected)
-      // so the cursor advances instead of replaying forever against a closing gateway.
-      const dispatch = (action: CardAction) => async (): Promise<CardActionDispatchResult> => {
-        if (gateway.draining) return 'rejected';
-        const msg = synthesizeCardActionMessage(action, gateway.botId);
-        const p = handleMessage(msg, config, store, router, groupContext, streamRelay, gateway.botId, cronStore, groupMdCache, groupMdWriteback, threadMdCache, threadMdWriteback)
-          .finally(() => { activeHandlers.delete(p); });
-        activeHandlers.add(p);
-        await p;
-        return 'completed';
-      };
-      const onCardAction = async (action: CardAction): Promise<void> => {
-        await handleCardAction({
-          action,
-          accountId,
+
+      // A4/A8 card-action handler (only when sendCard is on).
+      let onCardAction: ((action: CardAction) => Promise<void>) | undefined;
+      if (config.sdk.sendCard) {
+        // Re-run one verified card click as a normal turn. handleMessage owns routing,
+        // the per-session lock, and error handling; it resolves void on completion. A
+        // throw escapes to the A8 handler, which treats it as transient (bounded replay
+        // via the per-event attempt counter). During drain we drop the click (rejected)
+        // so the cursor advances instead of replaying forever against a closing gateway.
+        const dispatch = (action: CardAction) => async (): Promise<CardActionDispatchResult> => {
+          if (gateway.draining) return 'rejected';
+          const msg = synthesizeCardActionMessage(action, gateway.botId);
+          const p = handleMessage(msg, config, store, router, groupContext, streamRelay, gateway.botId, cronStore, groupMdCache, groupMdWriteback, threadMdCache, threadMdWriteback)
+            .finally(() => { activeHandlers.delete(p); });
+          activeHandlers.add(p);
+          await p;
+          return 'completed';
+        };
+        onCardAction = async (action: CardAction): Promise<void> => {
+          await handleCardAction({
+            action,
+            accountId,
+            apiUrl,
+            botToken,
+            dispatch: dispatch(action),
+            log: { info: pollLog.info, warn: pollLog.error },
+          });
+        };
+      }
+
+      // D1 doc-comment mention handler (only when docMention is on). Persistent
+      // dedupe + dead-letter live under the per-bot dataDir. The handler drives
+      // the SAME handleMessage pipeline; its `_docTask` context (nonce-stamped by
+      // synthesizeDocMentionMessage) routes the reply to the doc sink and fails
+      // every IM egress closed (D3). Unlike cards, this poller must run eagerly —
+      // doc mentions arrive with no prior card registration.
+      let onDocMention: ((mention: DocCommentMention) => Promise<void>) | undefined;
+      if (config.sdk.docMention) {
+        const dedupe = createFileDocMentionDedupeStore({ baseDir: config.dataDir, log: pollLog });
+        const deadLetter = createFileDocTaskDeadLetterStore({ baseDir: config.dataDir, log: pollLog });
+        const docDispatch = (m: BotMessage): Promise<void> => {
+          if (gateway.draining) return Promise.resolve();
+          const p = handleMessage(m, config, store, router, groupContext, streamRelay, gateway.botId, cronStore, groupMdCache, groupMdWriteback, threadMdCache, threadMdWriteback)
+            .finally(() => { activeHandlers.delete(p); });
+          activeHandlers.add(p);
+          return p;
+        };
+        const handleDoc = createDocMentionHandler({
+          botUid: gateway.botId,
           apiUrl,
           botToken,
-          dispatch: dispatch(action),
-          log: { info: pollLog.info, warn: pollLog.error },
+          docsBaseUrl: config.docsApiUrl ?? apiUrl,
+          dedupe,
+          deadLetter,
+          dispatch: docDispatch,
+          log: pollLog,
         });
-      };
-      setCardEventPollStarter(accountId, () => {
+        onDocMention = (mention: DocCommentMention): Promise<void> => handleDoc(mention);
+      }
+
+      const startPoller = (): void => {
         if (cardEventPoller) return; // idempotent: create the loop exactly once
         cardEventPoller = startEventPoller({
           apiUrl,
           botToken,
           cursorStore,
-          onCardAction,
+          ...(onCardAction ? { onCardAction } : {}),
+          ...(onDocMention ? { onDocMention } : {}),
           ...(config.sdk.eventWaitSeconds ? { waitSeconds: config.sdk.eventWaitSeconds } : {}),
           log: pollLog,
         });
-      });
+      };
+      // Register the lazy starter (first card registration triggers it) AND, when
+      // doc-mention is on, start now — a bot that only acts on doc comments never
+      // registers a card, so lazy-only would never poll.
+      setCardEventPollStarter(accountId, startPoller);
+      if (config.sdk.docMention) startPoller();
     }
 
     // Phase 2 (called by main() after cross-registration): open the WebSocket.
@@ -529,6 +576,14 @@ export async function handleMessage(
   const routeResult = await router.routeAndHandle(msg, async (result) => {
     wasProcessed = true;
     const { sessionKey } = result;
+    // D1: a genuine doc-comment task (authentic `_docTask` nonce). When set, the
+    // reply is routed to the doc-comment sink and EVERY IM egress side-effect
+    // below is bypassed by construction (the channel id is a non-routable
+    // sentinel; see stream-relay belt). A forged inbound `_docTask` fails the
+    // nonce check → undefined → normal IM handling.
+    const docTaskCtx: DocTaskContext | undefined = isAuthenticDocFire(msg.payload)
+      ? (msg.payload[DOC_TASK_PAYLOAD_KEY] as DocTaskContext)
+      : undefined;
     // A6: declared outside the try so the catch can settle the progress card too.
     let progressCardOn = false;
     // A6: turn-level handle for the progress card; fences every event/finalize/stop
@@ -934,7 +989,9 @@ export async function handleMessage(
       // notice as the agent invokes tools. Dedup consecutive identical notices
       // and cap the count per turn so a tool-heavy run doesn't spam the channel.
       let onToolUse: ((toolName: string, toolInput?: unknown) => void) | undefined;
-      if (config.sdk.toolProgress) {
+      // D1: no per-tool IM notices for a doc task (they would post to the
+      // sentinel channel). Progress belongs in the eventual doc reply.
+      if (config.sdk.toolProgress && !docTaskCtx) {
         let lastNotice = '';
         let noticeCount = 0;
         const MAX_TOOL_NOTICES = 10;
@@ -963,7 +1020,8 @@ export async function handleMessage(
       // stream via onAgentEvent. Gated on the server D12 profile advertising
       // display_enabled (resolveProgressCardCaps is fail-closed). Independent of
       // the lighter `toolProgress` text notices; both may be on.
-      if (config.sdk.progressCard && config.botToken && config.apiUrl) {
+      // D1: never for a doc task — the card would post to the sentinel channel.
+      if (config.sdk.progressCard && config.botToken && config.apiUrl && !docTaskCtx) {
         const { enabled, caps } = await resolveProgressCardCaps(config.apiUrl, config.botToken);
         // Round-2 fix #1: only install if THIS turn is still the session's latest and
         // has not already timed out. A zombie turn (timed out during the prelude, then
@@ -1168,6 +1226,7 @@ export async function handleMessage(
       // limited to the owner and audited. Gated behind sdk.octoManagement (off).
       if (config.sdk.octoManagement && config.botToken && config.apiUrl) {
         const coords: OctoManagementSessionCoords = {
+          channelId,
           requesterUid: msg.from_uid ?? '',
           ownerUid: router.getOwnerUid(),
         };
@@ -1235,51 +1294,81 @@ export async function handleMessage(
         }
       }
 
-      // --- Stream output to Octo ---
-      // A8 (#143): in groups, resolve v1 @name against the member list and
-      // validate v2 @[uid:name] uids against membership — a hallucinated uid not
-      // in the group is downgraded to plain text (no bogus @ notify). The member
-      // list is kept authoritative by refreshMembers (prunes departed members),
-      // best-effort fresh (1h refresh throttle). DMs have no member list and no
-      // @ semantics, so both args stay undefined (skip).
-      const outboundNameToUid = isGroup ? groupContext.getNameToUidMap(channelId) : undefined;
-      const isValidMentionUid = isGroup
-        ? (uid: string): boolean => groupContext.isMember(channelId, uid)
-        : undefined;
-      await streamRelay.deliver(channelId, channelType, teeChunks(), config.apiUrl, config.botToken, config.maxResponseChars, outboundNameToUid, isValidMentionUid);
-
-      // G8: Send read receipt after processing (fire-and-forget)
-      if (msg.message_id && msg.channel_id && msg.channel_type !== undefined) {
-        sendReadReceipt({
-          apiUrl: config.apiUrl,
-          botToken: config.botToken,
-          channelId: msg.channel_id,
-          channelType: msg.channel_type,
-          messageIds: [msg.message_id],
-        }).catch(() => { /* read receipt is best-effort; never surface failures */ });
-      }
-
-      // --- Store assistant response in history ---
-      const fullResponse = collected.join('');
-      if (fullResponse) {
-        store.appendAssistant(sessionKey, fullResponse, msg.message_seq, botId);
-        // G10: mark this message_seq as the last one we replied to. Next turn's
-        // segmented history will treat messages with seq <= this as [answered].
-        // #115: a synthetic cron fire carries message_seq=0 (no real wire seq);
-        // setting the cursor to 0 would reset it and mis-segment real history as
-        // all-[new]. Only advance the cursor for a real positive seq.
-        if (typeof msg.message_seq === 'number' && msg.message_seq > 0) {
-          store.setLastBotReplySeq(sessionKey, msg.message_seq);
+      if (docTaskCtx) {
+        // D1 / architect hard gate #2: a doc-task reply goes to the comment
+        // thread, NEVER IM. Fork here BY CONSTRUCTION — the doc task never
+        // reaches streamRelay.deliver / sendReadReceipt / the no-output IM
+        // fallback (all of which target the non-routable sentinel channel).
+        // Drain the stream to collect the final text (teeChunks pushes into
+        // `collected`); no bytes go to IM.
+        for await (const _chunk of teeChunks()) {
+          void _chunk;
         }
+        const finalText = collected.join('').trim();
+        if (finalText) {
+          try {
+            // postComment is the handler's bounded-retry wrapper over postDocReply
+            // (D2). finalDelivered is reported only AFTER it resolves.
+            await docTaskCtx.postComment(finalText, 'final');
+            docTaskCtx.reportTurn({ finalDelivered: true, delivered: true, lost: false, noticed: false });
+            // Keep session history for same-thread follow-ups.
+            store.appendAssistant(sessionKey, finalText, msg.message_seq, botId);
+          } catch (postErr) {
+            docTaskCtx.reportTurn({ finalDelivered: false, delivered: false, lost: true, noticed: false });
+            console.error(
+              `[cc-channel-octo] doc task final reply failed (session=${result.sessionKey}): ${String(postErr)}`,
+            );
+          }
+        }
+        // else: agent produced no text → report NOTHING (stays EMPTY) so the
+        // doc-mention handler posts the "no reply" notice. Never sendMessage to IM.
       } else {
-        // Agent produced no output — send a feedback message so user isn't left hanging
-        await sendMessage({
-          apiUrl: config.apiUrl,
-          botToken: config.botToken,
-          channelId,
-          channelType,
-          content: '[No response generated. Please try rephrasing your question.]',
-        });
+        // --- Stream output to Octo ---
+        // A8 (#143): in groups, resolve v1 @name against the member list and
+        // validate v2 @[uid:name] uids against membership — a hallucinated uid not
+        // in the group is downgraded to plain text (no bogus @ notify). The member
+        // list is kept authoritative by refreshMembers (prunes departed members),
+        // best-effort fresh (1h refresh throttle). DMs have no member list and no
+        // @ semantics, so both args stay undefined (skip).
+        const outboundNameToUid = isGroup ? groupContext.getNameToUidMap(channelId) : undefined;
+        const isValidMentionUid = isGroup
+          ? (uid: string): boolean => groupContext.isMember(channelId, uid)
+          : undefined;
+        await streamRelay.deliver(channelId, channelType, teeChunks(), config.apiUrl, config.botToken, config.maxResponseChars, outboundNameToUid, isValidMentionUid);
+
+        // G8: Send read receipt after processing (fire-and-forget)
+        if (msg.message_id && msg.channel_id && msg.channel_type !== undefined) {
+          sendReadReceipt({
+            apiUrl: config.apiUrl,
+            botToken: config.botToken,
+            channelId: msg.channel_id,
+            channelType: msg.channel_type,
+            messageIds: [msg.message_id],
+          }).catch(() => { /* read receipt is best-effort; never surface failures */ });
+        }
+
+        // --- Store assistant response in history ---
+        const fullResponse = collected.join('');
+        if (fullResponse) {
+          store.appendAssistant(sessionKey, fullResponse, msg.message_seq, botId);
+          // G10: mark this message_seq as the last one we replied to. Next turn's
+          // segmented history will treat messages with seq <= this as [answered].
+          // #115: a synthetic cron fire carries message_seq=0 (no real wire seq);
+          // setting the cursor to 0 would reset it and mis-segment real history as
+          // all-[new]. Only advance the cursor for a real positive seq.
+          if (typeof msg.message_seq === 'number' && msg.message_seq > 0) {
+            store.setLastBotReplySeq(sessionKey, msg.message_seq);
+          }
+        } else {
+          // Agent produced no output — send a feedback message so user isn't left hanging
+          await sendMessage({
+            apiUrl: config.apiUrl,
+            botToken: config.botToken,
+            channelId,
+            channelType,
+            content: '[No response generated. Please try rephrasing your question.]',
+          });
+        }
       }
 
       // A6: settle the progress card into its terminal frame. A non-success SDK
@@ -1306,17 +1395,22 @@ export async function handleMessage(
         const taskId = msg.message_id.split(':')[1];
         console.error(`[cc-channel-octo] cron: fired task ${taskId} failed during execution: ${String(err)}`);
       }
-      // Best-effort error reply
-      try {
-        await sendMessage({
-          apiUrl: config.apiUrl,
-          botToken: config.botToken,
-          channelId,
-          channelType,
-          content: 'An error occurred while processing your message. Please try again.',
-        });
-      } catch {
-        /* swallow — don't crash on reply failure */
+      // Best-effort error reply. D1: a doc task has no IM destination (its
+      // channelId is the sentinel — sendMessage would fail-loud in the belt);
+      // the doc-mention handler already posts a "no reply" notice to the comment
+      // thread because reportTurn was never called (turn stays EMPTY).
+      if (!docTaskCtx) {
+        try {
+          await sendMessage({
+            apiUrl: config.apiUrl,
+            botToken: config.botToken,
+            channelId,
+            channelType,
+            content: 'An error occurred while processing your message. Please try again.',
+          });
+        } catch {
+          /* swallow — don't crash on reply failure */
+        }
       }
     }
   });

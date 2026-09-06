@@ -37,6 +37,14 @@ export interface Config {
   botToken: string;
   apiUrl: string;
   /**
+   * D1/D2: docs service root for document-comment tasks (whole-doc export URL +
+   * doc-comment posts). Falls back to `apiUrl` when unset — a split deployment
+   * (IM/web on one origin, docs on another) sets it explicitly. SSRF-validated
+   * with the same `isAllowedApiUrl` gate as `apiUrl` (the bot token is sent to
+   * it). Populated by `resolveBotConfigs()`; consumers use `docsApiUrl ?? apiUrl`.
+   */
+  docsApiUrl?: string;
+  /**
    * Base directory containing the global config.json. Every bot's subtree lives
    * at `<baseDir>/<botId>/…`. Defaults to `~/.cc-channel-octo` (the dir of
    * DEFAULT_CONFIG_PATH); when an explicit config path is passed, it is that
@@ -321,6 +329,14 @@ export interface Config {
      */
     octoManagement?: boolean;
     /**
+     * D1: when true, poll for `doc_comment_mention` events and run each as an
+     * isolated doc-task turn whose reply is posted to the document comment thread
+     * (never IM — D3 fails every IM egress closed for these sessions). Requires
+     * `botId` + `apiUrl` + `botToken`. Default off. Per-bot — enable only for
+     * bots meant to act on document comments.
+     */
+    docMention?: boolean;
+    /**
      * External MCP servers exposed to the agent, keyed by server name (tools
      * surface as `mcp__<name>__<tool>`). Merged with any in-process servers cc
      * injects per turn (cron, GROUP.md write-back) — a name clash lets those
@@ -415,6 +431,7 @@ export interface BotOverride {
    */
   botToken?: string;
   apiUrl?: string;
+  docsApiUrl?: string;
   model?: string;
   systemPrompt?: string;
   botBlocklist?: string[];
@@ -425,6 +442,7 @@ export interface BotOverride {
 type PartialConfig = {
   botToken?: string;
   apiUrl?: string;
+  docsApiUrl?: string;
   groupConfigDir?: string;
   serverMd?: boolean;
   serverMdTtlMs?: number;
@@ -515,6 +533,7 @@ function mergeConfig(base: Config, override: PartialConfig): Config {
   return {
     botToken: override.botToken ?? base.botToken,
     apiUrl: override.apiUrl ?? base.apiUrl,
+    docsApiUrl: override.docsApiUrl ?? base.docsApiUrl,
     // baseDir + derived dirs are filled by loadConfig()/resolveBotConfigs(),
     // not by config-file merge.
     baseDir: base.baseDir,
@@ -590,6 +609,13 @@ export function loadConfig(configPath?: string): Config {
   if (!isAllowedApiUrl(final.apiUrl)) {
     throw new Error(
       `Unsafe apiUrl: ${final.apiUrl} — must be https:// or http://localhost/http://127.0.0.1 (SSRF protection)`,
+    );
+  }
+  // D1/D2: docsApiUrl (optional; when unset it falls back to apiUrl per bot) gets
+  // the same SSRF policy as apiUrl — the bot token is sent to it.
+  if (final.docsApiUrl && !isAllowedApiUrl(final.docsApiUrl)) {
+    throw new Error(
+      `Unsafe docsApiUrl: ${final.docsApiUrl} — must be https:// or http://localhost/http://127.0.0.1 (SSRF protection)`,
     );
   }
   // Q1: the gateway endpoint receives the Anthropic API key and all prompt /
@@ -741,6 +767,9 @@ export function resolveBotConfigs(config: Config): Config[] {
       botSoul ?? perBotFile.sdk?.systemPrompt ?? bot.systemPrompt ?? sharedSystemPrompt;
 
     const apiUrl = perBotFile.apiUrl ?? bot.apiUrl ?? config.apiUrl;
+    // D1/D2: docs service root. `?? apiUrl` fallback (cc has no accounts
+    // registry); SSRF-gated below with the same policy as apiUrl.
+    const docsApiUrl = perBotFile.docsApiUrl ?? bot.docsApiUrl ?? config.docsApiUrl ?? apiUrl;
     const model = perBotFile.sdk?.model ?? bot.model ?? config.sdk.model;
 
     const resolved: Config = {
@@ -749,6 +778,7 @@ export function resolveBotConfigs(config: Config): Config[] {
       botId: id,
       botToken,
       apiUrl,
+      docsApiUrl,
       baseDir: config.baseDir,
       dataDir: botDataDir,
       cwdBase: botCwdBase,
@@ -776,6 +806,11 @@ export function resolveBotConfigs(config: Config): Config[] {
     };
     if (!isAllowedApiUrl(resolved.apiUrl)) {
       throw new Error(`Bot "${id}": unsafe apiUrl ${resolved.apiUrl} (SSRF protection)`);
+    }
+    // D1/D2 requirement #4: the docs URL receives the bot token (whole-doc export
+    // + comment posts), so it gets the SAME SSRF gate as apiUrl — no new policy.
+    if (resolved.docsApiUrl && !isAllowedApiUrl(resolved.docsApiUrl)) {
+      throw new Error(`Bot "${id}": unsafe docsApiUrl ${resolved.docsApiUrl} (SSRF protection)`);
     }
     // GROUP.md trust boundary: groupConfigDir must not be the bot's writable cwd.
     assertGroupConfigDirOutsideCwd(resolved);

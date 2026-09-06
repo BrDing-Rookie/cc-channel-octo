@@ -26,6 +26,7 @@ import { z } from 'zod';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import type { ChannelType } from './octo/types.js';
 import { sendMediaToChannel, sendRichTextToChannel } from './media-outbound.js';
+import { docTaskImEgressBlockReason } from './doc-task-scope.js';
 
 /** MCP server name; tools surface as `mcp__send_media__octo_send_*`. */
 export const MEDIA_SEND_TOOL_SERVER_NAME = 'send_media';
@@ -96,6 +97,11 @@ export function buildMediaSendTools(
     if (!coords.channelId || !coords.channelId.trim()) {
       return 'the current Octo delivery channel is unavailable';
     }
+    // D3 egress fail-closed: a doc-task session has no IM destination, so both
+    // media sends bind to a non-routable sentinel channel. Refuse here (shared by
+    // both tools) rather than let the send hit a bogus channel.
+    const docTaskBlock = docTaskImEgressBlockReason(coords.channelId, `${SEND_MEDIA_TOOL_NAME}/${SEND_RICH_TEXT_TOOL_NAME}`);
+    if (docTaskBlock) return docTaskBlock;
     return null;
   };
 

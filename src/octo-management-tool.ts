@@ -59,6 +59,7 @@ import {
 } from "./octo/api.js";
 import { getCachedGroupMembers } from "./permission.js";
 import { emitAuditLog } from "./audit.js";
+import { docTaskImEgressBlockReason } from "./doc-task-scope.js";
 
 /** MCP server name; the tool surfaces as `mcp__octo_management__octo_management`. */
 export const OCTO_MANAGEMENT_TOOL_SERVER_NAME = "octo_management";
@@ -92,6 +93,11 @@ export function _clearResolveCache(): void {
 }
 
 export interface OctoManagementSessionCoords {
+  /** Current session channel id (as delivered on the inbound message). Used by
+   * the D3 doc-task egress guard — a doc-task session must not drive group
+   * discovery / mutation (roster exfiltration + lateral movement). Optional so
+   * pre-existing callers/tests keep compiling; index.ts always supplies it. */
+  channelId?: string;
   /** uid of the human who drove this turn — subject of the owner gate + audit. */
   requesterUid: string;
   /** Bot owner uid (registerBot.owner_uid); empty string when unknown. */
@@ -170,6 +176,12 @@ export function buildOctoManagementTools(
       async (args) => {
         const { apiUrl, botToken } = config;
         if (!botToken || !apiUrl) return errResult("Octo account is not fully configured");
+
+        // D3 egress fail-closed: a doc-task session must not drive group
+        // discovery or mutation — roster reads exfiltrate into the doc reply and
+        // group edits are lateral movement. Refuse by session context.
+        const docTaskBlock = docTaskImEgressBlockReason(coords.channelId, OCTO_MANAGEMENT_TOOL_NAME);
+        if (docTaskBlock) return errResult(docTaskBlock);
 
         const action = args.action;
 

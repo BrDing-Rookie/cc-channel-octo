@@ -21,6 +21,7 @@
  */
 import { ChannelType } from "./octo/types.js";
 import { THREAD_ID_SEPARATOR } from "./octo/channel-id.js";
+import { isDocTaskNonRoutableTarget } from "./doc-task-scope.js";
 
 export interface ParsedTarget {
   channelId: string;
@@ -50,6 +51,18 @@ function stripGroupNamespacePrefixes(target: string): string {
  */
 export function parseTarget(target: string, knownGroupIds?: Set<string>): ParsedTarget {
   const trimmed = target.trim();
+
+  // D3 fail-closed: the doc-task session's channel id is a non-routable sentinel
+  // (see doc-task-scope.ts). It must never resolve to any real channel — a doc
+  // task's output belongs in the comment thread, never IM. Throwing here at the
+  // single outbound-target resolver means any code that tries to route the
+  // session channel as an IM destination (now or a future outbound path) fails
+  // loud instead of leaking, rather than each send site re-implementing a guard.
+  if (isDocTaskNonRoutableTarget(trimmed)) {
+    throw new Error(
+      "octo: document-comment task sessions have no IM destination — replies must go to the doc comment thread, not a chat target",
+    );
+  }
 
   // Explicit group/channel prefix always wins.
   if (trimmed.startsWith("group:") || trimmed.startsWith("channel:")) {
