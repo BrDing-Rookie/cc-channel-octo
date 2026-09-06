@@ -26,6 +26,10 @@ const api = vi.hoisted(() => ({
   listThreadMembers: vi.fn(),
   joinThread: vi.fn(),
   leaveThread: vi.fn(),
+  searchSpaceMembers: vi.fn(),
+  getVoiceContext: vi.fn(),
+  updateVoiceContext: vi.fn(),
+  deleteVoiceContext: vi.fn(),
 }));
 vi.mock("../octo/api.js", () => api);
 
@@ -152,5 +156,86 @@ describe("mutations (owner-gated + audited)", () => {
     api.joinThread.mockResolvedValue(undefined);
     const out = parse(await invoke({ action: "join-thread", groupId: "g1", shortId: "t1" }, OWNER));
     expect(out.joined).toBe(true);
+  });
+});
+
+describe("B8: search-members (space-wide people search, read-only)", () => {
+  it("searches by keyword and returns members without an owner gate", async () => {
+    api.searchSpaceMembers.mockResolvedValue([
+      { uid: "u1", name: "Alice", robot: 0 },
+      { uid: "u2", name: "Alicia", robot: 0 },
+    ]);
+    const out = parse(await invoke({ action: "search-members", keyword: "Ali" }, MEMBER));
+    expect(out.total).toBe(2);
+    expect(out.members[0].uid).toBe("u1");
+    expect(api.searchSpaceMembers).toHaveBeenCalledWith(
+      expect.objectContaining({ keyword: "Ali", apiUrl: CONFIG.apiUrl, botToken: CONFIG.botToken }),
+    );
+  });
+
+  it("accepts name as a keyword alias, passes spaceId and limit through", async () => {
+    api.searchSpaceMembers.mockResolvedValue([]);
+    await invoke({ action: "search-members", name: "Bob", spaceId: "sp1", limit: 5 }, MEMBER);
+    expect(api.searchSpaceMembers).toHaveBeenCalledWith(
+      expect.objectContaining({ keyword: "Bob", spaceId: "sp1", limit: 5 }),
+    );
+  });
+
+  it("is NOT audited as a mutation (read-only discovery)", async () => {
+    api.searchSpaceMembers.mockResolvedValue([]);
+    await invoke({ action: "search-members", keyword: "x" }, MEMBER);
+    expect(auditLines).toHaveLength(0);
+  });
+});
+
+describe("B9: voice-context CRUD (owner-only personal context)", () => {
+  it("voice-context-read returns the context for the owner", async () => {
+    api.getVoiceContext.mockResolvedValue({ has_context: true, context: "call me Ada", updated_at: "t" });
+    const out = parse(await invoke({ action: "voice-context-read" }, OWNER));
+    expect(out.has_context).toBe(true);
+    expect(out.context).toBe("call me Ada");
+  });
+
+  it("voice-context-read is refused for a non-owner (and never calls the API)", async () => {
+    const res = await invoke({ action: "voice-context-read" }, MEMBER);
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/limited to the bot owner/);
+    expect(api.getVoiceContext).not.toHaveBeenCalled();
+  });
+
+  it("voice-context-update sets the content for the owner (audited allowed)", async () => {
+    api.updateVoiceContext.mockResolvedValue(undefined);
+    const out = parse(await invoke({ action: "voice-context-update", content: "  say Octo not otto  " }, OWNER));
+    expect(out.updated).toBe(true);
+    expect(api.updateVoiceContext).toHaveBeenCalledWith(
+      expect.objectContaining({ content: "say Octo not otto" }),
+    );
+    expect(auditLines.some((l) => l.action === "management:voice-context-update" && l.result === "allowed")).toBe(true);
+  });
+
+  it("voice-context-update rejects empty content", async () => {
+    const res = await invoke({ action: "voice-context-update", content: "   " }, OWNER);
+    expect(res.isError).toBe(true);
+    expect(api.updateVoiceContext).not.toHaveBeenCalled();
+  });
+
+  it("voice-context-update is denied + audited for a non-owner", async () => {
+    const res = await invoke({ action: "voice-context-update", content: "x" }, MEMBER);
+    expect(res.isError).toBe(true);
+    expect(api.updateVoiceContext).not.toHaveBeenCalled();
+    expect(auditLines.some((l) => l.action === "management:voice-context-update" && l.result === "denied")).toBe(true);
+  });
+
+  it("voice-context-delete clears the context for the owner", async () => {
+    api.deleteVoiceContext.mockResolvedValue(undefined);
+    const out = parse(await invoke({ action: "voice-context-delete" }, OWNER));
+    expect(out.deleted).toBe(true);
+    expect(api.deleteVoiceContext).toHaveBeenCalledTimes(1);
+  });
+
+  it("voice-context-delete is denied for a non-owner", async () => {
+    const res = await invoke({ action: "voice-context-delete" }, MEMBER);
+    expect(res.isError).toBe(true);
+    expect(api.deleteVoiceContext).not.toHaveBeenCalled();
   });
 });

@@ -15,6 +15,12 @@
  *     - list-threads         B7  listThreads
  *     - get-thread           B7  getThread
  *     - list-thread-members  B7  listThreadMembers
+ *     - search-members       B8  searchSpaceMembers (space-wide people search)
+ *
+ *   Owner-only (personal data — see SECURITY):
+ *     - voice-context-read   B9  getVoiceContext (owner's voice-correction context)
+ *     - voice-context-update B9  updateVoiceContext (mutation, audited)
+ *     - voice-context-delete B9  deleteVoiceContext (mutation, audited)
  *
  *   Mutations (owner-gated + audited — see SECURITY below):
  *     - create-group         B6  createGroup
@@ -56,6 +62,10 @@ import {
   listThreadMembers,
   joinThread,
   leaveThread,
+  searchSpaceMembers,
+  getVoiceContext,
+  updateVoiceContext,
+  deleteVoiceContext,
 } from "./octo/api.js";
 import { getCachedGroupMembers } from "./permission.js";
 import { emitAuditLog } from "./audit.js";
@@ -77,7 +87,19 @@ const MUTATING_ACTIONS = new Set<string>([
   "delete-thread",
   "join-thread",
   "leave-thread",
+  // B9: the owner's PERSONAL voice-correction context — writing/clearing it is a
+  // mutation of the owner's private data, so owner-gated + audited like the rest.
+  "voice-context-update",
+  "voice-context-delete",
 ]);
+
+/**
+ * B9: owner-only READ actions. `voice-context-read` returns the owner's PERSONAL
+ * voice-correction context — private to the owner, not group discovery — so it is
+ * gated to the owner uid even though it does not mutate anything (hence separate
+ * from MUTATING_ACTIONS, which additionally audits as a state change).
+ */
+const OWNER_ONLY_READ_ACTIONS = new Set<string>(["voice-context-read"]);
 
 /** 30-second TTL for name→target resolution, matching openclaw's resolve cache. */
 const RESOLVE_CACHE_TTL_MS = 30_000;
@@ -133,6 +155,10 @@ const ACTIONS = [
   "delete-thread",
   "join-thread",
   "leave-thread",
+  "search-members",
+  "voice-context-read",
+  "voice-context-update",
+  "voice-context-delete",
 ] as const;
 
 const OCTO_MANAGEMENT_DESCRIPTION =
@@ -141,14 +167,18 @@ const OCTO_MANAGEMENT_DESCRIPTION =
   "DISCOVERY (read-only): list-groups (all groups the bot is in), shared-groups " +
   "(groups you and the bot share), group-info, group-members, resolve (turn a human " +
   "NAME into concrete channel candidates — always resolve before sending, never " +
-  "hand-build a target), list-threads, get-thread, list-thread-members.\n" +
+  "hand-build a target), list-threads, get-thread, list-thread-members, search-members " +
+  "(search people across the whole space by keyword).\n" +
   "MANAGEMENT (owner-only): create-group, update-group, add-members, remove-members, " +
   "create-thread, delete-thread, join-thread, leave-thread.\n" +
+  "VOICE CONTEXT (owner-only, your personal voice-correction context): voice-context-read, " +
+  "voice-context-update (set content), voice-context-delete.\n" +
   "Params by action — groupId: group number (required by most); shortId: thread " +
   "short id (thread actions); members: uid array (create-group/add/remove); creator: " +
   "uid (create-group); name/notice: group fields; threadName: new thread name; keyword " +
-  "or name + kind(group|thread|all) + limit: resolve. Management actions require a " +
-  "User Bot token and are limited to the bot owner.";
+  "or name + kind(group|thread|all) + limit: resolve; keyword + spaceId + limit: " +
+  "search-members; content: voice-context text (voice-context-update). Management and " +
+  "voice-context actions require a User Bot token and are limited to the bot owner.";
 
 export function buildOctoManagementTools(
   config: OctoManagementToolConfig,
@@ -169,9 +199,11 @@ export function buildOctoManagementTools(
         name: z.string().optional().describe("Group name (create/update-group) or resolve name."),
         notice: z.string().optional().describe("Group notice (update-group)."),
         threadName: z.string().optional().describe("New thread name (create-thread)."),
-        keyword: z.string().optional().describe("Resolve keyword (alias for name)."),
+        keyword: z.string().optional().describe("Resolve keyword (alias for name); also the search keyword for search-members."),
         kind: z.enum(["group", "thread", "all"]).optional().describe("Resolve target kind."),
-        limit: z.number().int().positive().optional().describe("Resolve result cap."),
+        limit: z.number().int().positive().optional().describe("Result cap (resolve / search-members)."),
+        spaceId: z.string().optional().describe("Space id (search-members; optional — defaults to the bot's space)."),
+        content: z.string().optional().describe("Voice-context text (voice-context-update)."),
       },
       async (args) => {
         const { apiUrl, botToken } = config;
@@ -205,6 +237,13 @@ export function buildOctoManagementTools(
             channelType: 0,
             result: "allowed",
           });
+        }
+
+        // B9: owner-only READ gate — voice-context-read exposes the owner's
+        // private voice-correction context, so a non-owner requester is refused
+        // (no audit as a state change; it mutates nothing).
+        if (OWNER_ONLY_READ_ACTIONS.has(action) && !isOwner) {
+          return errResult(`action "${action}" is limited to the bot owner`);
         }
 
         try {
@@ -382,6 +421,47 @@ export function buildOctoManagementTools(
               if (!groupId || !shortId) return errResult("groupId and shortId are required for leave-thread");
               await leaveThread({ apiUrl, botToken, groupNo: groupId, shortId, signal: AbortSignal.timeout(OP_TIMEOUT_MS) });
               return jsonResult({ left: true, groupId, shortId });
+            }
+
+            case "search-members": {
+              // B8: search people across the whole space by keyword. Read-only
+              // discovery — surfaces only what the bot's own token can already
+              // see; the D3 doc-task egress guard above blocks it for doc-task
+              // sessions so a roster cannot be exfiltrated into a doc reply.
+              const keyword = ((args.keyword as string | undefined) ?? (args.name as string | undefined))?.trim();
+              const limit =
+                typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
+                  ? Math.floor(args.limit)
+                  : undefined;
+              const members = await searchSpaceMembers({
+                apiUrl,
+                botToken,
+                keyword: keyword || undefined,
+                spaceId: (args.spaceId as string | undefined) ?? undefined,
+                limit,
+                signal: AbortSignal.timeout(OP_TIMEOUT_MS),
+              });
+              return jsonResult({ members, total: members.length });
+            }
+
+            case "voice-context-read": {
+              // B9: read the owner's personal voice-correction context (owner-gated above).
+              const ctx = await getVoiceContext({ apiUrl, botToken, signal: AbortSignal.timeout(OP_TIMEOUT_MS) });
+              return jsonResult(ctx);
+            }
+
+            case "voice-context-update": {
+              // B9: set the owner's personal voice-correction context (owner-gated + audited above).
+              const content = (args.content as string | undefined)?.trim();
+              if (!content) return errResult("content is required for voice-context-update");
+              await updateVoiceContext({ apiUrl, botToken, content, signal: AbortSignal.timeout(OP_TIMEOUT_MS) });
+              return jsonResult({ updated: true });
+            }
+
+            case "voice-context-delete": {
+              // B9: clear the owner's personal voice-correction context (idempotent; owner-gated + audited above).
+              await deleteVoiceContext({ apiUrl, botToken, signal: AbortSignal.timeout(OP_TIMEOUT_MS) });
+              return jsonResult({ deleted: true });
             }
 
             default:
