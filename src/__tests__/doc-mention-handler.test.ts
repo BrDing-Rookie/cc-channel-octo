@@ -137,4 +137,45 @@ describe("createDocMentionHandler", () => {
     await handle(MENTION);
     expect(dispatch).not.toHaveBeenCalled();
   });
+
+  // Severe fix 1: on a split deployment the comment reply must be POSTed to the
+  // resolved docs root (config.docsApiUrl ?? apiUrl), not the IM apiUrl.
+  it("posts the reply to docsBaseUrl (docsApiUrl), NOT the IM apiUrl, when they differ", async () => {
+    const dedupe = createMemoryDocMentionDedupeStore();
+    const dispatch: DocMentionDispatch = async (msg) => {
+      const ctx = ctxOf(msg);
+      await ctx.postComment("the answer", "final");
+      ctx.reportTurn({ finalDelivered: true, delivered: true, lost: false, noticed: false });
+    };
+    const handle = createDocMentionHandler({
+      botUid: "bot_1",
+      apiUrl: "https://im.example.com",
+      docsBaseUrl: "https://docs.example.com",
+      botToken: "t",
+      dedupe,
+      dispatch,
+    });
+
+    await handle(MENTION);
+
+    expect(postDocReply).toHaveBeenCalledTimes(1);
+    expect(postDocReply.mock.calls[0][0]).toMatchObject({ apiUrl: "https://docs.example.com" });
+    expect(postDocReply.mock.calls[0][0].apiUrl).not.toBe("https://im.example.com");
+  });
+
+  it("falls back to apiUrl for the reply when docsBaseUrl is absent (single-host deploy)", async () => {
+    const dedupe = createMemoryDocMentionDedupeStore();
+    const dispatch: DocMentionDispatch = async (msg) => {
+      const ctx = ctxOf(msg);
+      await ctx.postComment("the answer", "final");
+      ctx.reportTurn({ finalDelivered: true, delivered: true, lost: false, noticed: false });
+    };
+    const handle = createDocMentionHandler({
+      botUid: "bot_1", apiUrl: "https://im.example.com", botToken: "t", dedupe, dispatch,
+    });
+
+    await handle(MENTION);
+
+    expect(postDocReply.mock.calls[0][0]).toMatchObject({ apiUrl: "https://im.example.com" });
+  });
 });
