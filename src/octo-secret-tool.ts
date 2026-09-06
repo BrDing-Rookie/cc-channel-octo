@@ -368,11 +368,18 @@ export function buildOctoSecretTools(
             await handle.close();
           }
         } catch (err) {
-          // A write error may include the path but never the content. Echo the
-          // jail-relative path only — never the absolute path (would leak the
-          // operator's jail root into the LLM-visible transcript).
+          // A write error's MESSAGE can carry the absolute path (e.g. an fs error
+          // "EACCES: permission denied, open '/abs/...'"), which would leak the
+          // operator's jail root into the LLM-visible transcript. Surface ONLY the
+          // error CODE (EACCES / ELOOP / ENOENT / …) — never err.message — so the
+          // "never the absolute path" guarantee holds strictly. The jail-relative
+          // path is still echoed for actionability.
+          const code =
+            err && typeof err === 'object' && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
+              ? (err as { code: string }).code
+              : 'write failed';
           return errResult(
-            `Resolved the secret but failed to write it to "${relative(root, absPath)}": ${err instanceof Error ? err.message : String(err)}`,
+            `Resolved the secret but failed to write it to "${relative(root, absPath)}": ${code}`,
           );
         }
 
