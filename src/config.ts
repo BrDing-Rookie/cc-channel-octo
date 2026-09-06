@@ -358,6 +358,24 @@ export interface Config {
      */
     octoManagement?: boolean;
     /**
+     * B10: when true, give the agent an in-process `octo_secret` MCP tool with a
+     * `write-secret` action — it resolves one of the owner's stored secrets
+     * (`resolveSecret`) and writes the plaintext to a file INSIDE the current
+     * session's cwd sandbox, applying a full FS jail (`..` / symlink / TOCTOU
+     * rejection via O_NOFOLLOW, mode 0o600). The plaintext never enters the tool
+     * arguments or return value. Owner-gated + audited. Default off — enable only
+     * for trusted-context bots that must materialize a key into a config file.
+     */
+    octoSecret?: boolean;
+    /**
+     * B10: optional explicit jail root for `write-secret`. When set it WINS over
+     * the per-session cwd sandbox default, letting an operator pin secret writes
+     * to a narrower directory. Must be an absolute, operator-owned directory
+     * (never the agent-writable sandbox root of another feature). When unset the
+     * jail root defaults to the current session's cwd sandbox.
+     */
+    secretsFileRoot?: string;
+    /**
      * D1: when true, poll for `doc_comment_mention` events and run each as an
      * isolated doc-task turn whose reply is posted to the document comment thread
      * (never IM — D3 fails every IM egress closed for these sessions). Requires
