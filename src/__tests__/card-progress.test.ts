@@ -363,6 +363,50 @@ describe("round-2 combination timing", () => {
     expect(term.transient).toBeUndefined();
     expect(String(term.plain)).toContain("Stopped");
   });
+
+  it("dispatch timeout mid first-frame, then a deterministic 4xx: gives up, no retry / no double-send", async () => {
+    let rejectSend: (e: Error) => void = () => {};
+    sendCardMessage.mockImplementationOnce(
+      () => new Promise<{ message_id: string }>((_res, rej) => { rejectSend = rej; }),
+    );
+
+    const h = setCardContext("df4", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+
+    // Timeout terminalizes while the first-frame send is still in flight…
+    markStopped(h);
+    // …then the first-frame send fails deterministically (400).
+    rejectSend(new Error("Octo API /v1/bot/sendMessage failed (400): bad card"));
+    await vi.advanceTimersByTimeAsync(1000); // well past the 500ms retry backoff
+
+    // A deterministic failure disables the entry; the terminal must NOT retry.
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+    expect(editCardMessage).not.toHaveBeenCalled();
+  });
+
+  it("dispatch timeout mid first-frame, then success with no message_id: no double-send, pending cleaned", async () => {
+    let resolveSend: (v: { message_id?: string }) => void = () => {};
+    sendCardMessage.mockImplementationOnce(
+      () => new Promise<{ message_id?: string }>((res) => { resolveSend = res; }),
+    );
+
+    const h = setCardContext("df5", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+
+    markStopped(h);
+    // First-frame "succeeds" but returns no message_id → the entry is disabled.
+    resolveSend({});
+    await vi.advanceTimersByTimeAsync(1000);
+
+    // No second send (the card may already exist server-side) and no edit; the
+    // pending terminal is dropped rather than retried indefinitely.
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+    expect(editCardMessage).not.toHaveBeenCalled();
+  });
 });
 
 describe("resolveProgressCardCaps gating", () => {

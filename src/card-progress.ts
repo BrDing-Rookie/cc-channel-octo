@@ -401,9 +401,16 @@ async function flush(sessionKey: string): Promise<void> {
     entry.inFlight = false;
     if (pendingTerminals.has(entry)) {
       // The entry terminalized (stop/finalize) while this flush was in flight — its
-      // deliverTerminal deferred on inFlight. Now that the send has landed (and any
-      // message_id recorded above), drain the recorded terminal onto the SAME card.
-      void deliverTerminal(entry);
+      // deliverTerminal deferred on inFlight. If that in-flight send DISABLED the
+      // entry (deterministic 4xx, or a success with no message_id → skip), do NOT
+      // retry: a deterministic failure must give up, and a card that may already
+      // exist server-side must not be sent twice. Otherwise drain the recorded
+      // terminal onto the SAME card (message_id was recorded above).
+      if (entry.skip) {
+        dropTerminal(entry);
+      } else {
+        void deliverTerminal(entry);
+      }
     } else if (entry.dirty && !entry.skip && cards.get(sessionKey) === entry &&
         cooldownRemainingMs(entry.ctx.apiUrl) === 0) {
       scheduleFlush(sessionKey, entry);
@@ -521,6 +528,10 @@ function dropTerminal(entry: CardEntry): void {
  */
 async function deliverTerminal(entry: CardEntry): Promise<void> {
   if (!entry.terminal || !pendingTerminals.has(entry)) return;
+  // Disabled (deterministic 4xx earlier, or a placeholder send that returned no
+  // message_id): never send — give up and drop. Defense in depth for every entry
+  // point (flush's finally already screens this; the retry timer path relies on it).
+  if (entry.skip) { dropTerminal(entry); return; }
   // A mid-frame flush from before terminalization may still be in flight; let it
   // finish first so the terminal frame is strictly last, then retry.
   if (entry.inFlight) { scheduleTerminalRetry(entry, TERMINAL_RETRY_MS); return; }
