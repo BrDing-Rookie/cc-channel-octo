@@ -5,12 +5,21 @@
 import type { Config } from './config.js';
 import type { BotMessage, MentionEntity } from './octo/types.js';
 import { ChannelType, MessageType } from './octo/types.js';
-import { sendMessage } from './octo/api.js';
+import { sendMessage, getMentionPref, type MentionPref } from './octo/api.js';
 import { isAuthenticCronFire } from './cron-fire-marker.js';
 import { isAuthenticDocFire, DOC_TASK_PAYLOAD_KEY } from './doc-fire-marker.js';
 import { extractParentGroupNo, extractThreadShortId } from './octo/channel-id.js';
 import type { GroupMdCache, ThreadMdCache } from './group-md-cache.js';
-import { isGroupMdUpdateEvent, isThreadMdUpdateEvent } from './group-md-events.js';
+import type { MentionPrefCache } from './mention-pref-cache.js';
+import { isGroupMdUpdateEvent, isThreadMdUpdateEvent, isMentionPrefUpdateEvent } from './group-md-events.js';
+
+/**
+ * F1: server-authoritative robot-flag lookup, injected so the router can decide
+ * whether a mention-free relaxation is being requested by a human vs a bot. Backed
+ * by `GroupContext.isRobot(channelId, uid)`: `true` = confirmed bot, `false` =
+ * confirmed human, `undefined` = unknown (member roster not yet warmed for this uid).
+ */
+export type RobotFlagLookup = (channelId: string, uid: string) => boolean | undefined;
 
 export interface RouteResult {
   sessionKey: string;
@@ -91,12 +100,31 @@ export class SessionRouter {
    */
   private readonly threadMdCache?: ThreadMdCache;
 
+  /**
+   * F1: in-memory server mention-pref cache. Held so the group mention gate can
+   * consult the server-authoritative two-axis pref (replacing the static
+   * `mentionFreeGroups` list) and a `mention_pref_updated` event can invalidate
+   * the affected group's entry. Optional — omitted (or with `serverMentionPref`
+   * off) the server-pref path is skipped and only the static list is honored.
+   */
+  private readonly mentionPrefCache?: MentionPrefCache;
+
+  /**
+   * F1: server-authoritative robot-flag lookup (see {@link RobotFlagLookup}). Used
+   * only on the server-pref relaxation path to enforce the F1 red line — only a
+   * human sender may be relaxed; a bot / OBO sender never is. Optional; when
+   * omitted the gate falls back to the name-heuristic bot check alone.
+   */
+  private readonly isRobotSender?: RobotFlagLookup;
+
   constructor(
     config: Config,
     robotId: string,
     ownerUid = '',
     groupMdCache?: GroupMdCache,
     threadMdCache?: ThreadMdCache,
+    mentionPrefCache?: MentionPrefCache,
+    isRobotSender?: RobotFlagLookup,
   ) {
     this.config = config;
     this.robotId = robotId;
@@ -104,6 +132,8 @@ export class SessionRouter {
     this.knownBotUids.add(robotId);
     this.groupMdCache = groupMdCache;
     this.threadMdCache = threadMdCache;
+    this.mentionPrefCache = mentionPrefCache;
+    this.isRobotSender = isRobotSender;
   }
 
   /** G14: register another known bot uid (future multi-bot support). */
@@ -501,6 +531,93 @@ export class SessionRouter {
     }
   }
 
+  /**
+   * F1: mention-pref analogue of {@link handleGroupMdEvent}. On a
+   * `mention_pref_updated` event invalidate that group's cached two-axis pref, so
+   * the next mention-free decision re-fetches the authoritative copy over the bot
+   * token — never trusting the event body (invalidation is non-destructive; the
+   * worst a forged event can do is force a redundant authenticated re-fetch of the
+   * real pref). Gated on `serverMentionPref`: with the flag off the cache is never
+   * populated, so there is nothing to invalidate. Best-effort; never throws.
+   *
+   * The group is identified from the event's `group_no`, falling back to the
+   * parent group of `channel_id` only when the event omits it AND happened to
+   * arrive on a group-like channel (same delivery model as the md events —
+   * XIN-173). The literal set is disjoint from the md literals, so this and the
+   * md handlers never both fire for one event.
+   */
+  private handleMentionPrefEvent(msg: BotMessage): void {
+    if (!this.config.serverMentionPref || !this.mentionPrefCache) return;
+    const event = msg.payload.event;
+    if (!isMentionPrefUpdateEvent(event, this.config.mentionPrefEventTypes)) return;
+
+    let groupNo = event?.group_no ?? '';
+    if (groupNo === '' && this.isGroupLike(msg.channel_type)) {
+      groupNo = extractParentGroupNo(msg.channel_id ?? '');
+    }
+    if (groupNo === '') return;
+
+    try {
+      this.mentionPrefCache.invalidate(groupNo);
+    } catch {
+      /* best-effort: a refresh hiccup must never block dropping the event */
+    }
+  }
+
+  /**
+   * F1: decide whether the server-authoritative two-axis mention preference
+   * relaxes the @-mention requirement for this group message. Returns true ONLY
+   * when: the feature is enabled and a cache is wired; the sender is a HUMAN (the
+   * hard red line — a bot / OBO sender is never relaxed); and the group's
+   * `pref.effective` (`no_mention && group_allow_no_mention`, ANDed server-side)
+   * is true. Any failure path is fail-closed (mention still required): the pref
+   * fetch itself never throws and degrades to `effective:false`. Async but cheap:
+   * the pref is cached (60 s TTL) so at most one lookup per group per TTL window.
+   */
+  private async isServerMentionFree(msg: BotMessage, channelId: string): Promise<boolean> {
+    if (!this.config.serverMentionPref || !this.mentionPrefCache) return false;
+    // Hard red line (F1): only a human sender may be relaxed. A bot / OBO sender
+    // is never granted mention-free treatment even if the group pref allows it.
+    if (!this.senderIsHuman(channelId, msg.from_uid)) return false;
+    const groupNo = extractParentGroupNo(channelId);
+    if (groupNo === '') return false;
+    const pref = await this.resolveMentionPref(groupNo);
+    return pref.effective === true;
+  }
+
+  /**
+   * F1: is this sender a human (eligible for mention-free relaxation)? Prefers the
+   * server-authoritative robot flag (`GroupContext.isRobot`): `true` → bot (never
+   * relaxed), `false` → confirmed human. When the flag is unknown (`undefined` —
+   * the roster has not been warmed for this uid yet, since the member refresh runs
+   * after the gate) it fails closed against bots via the name heuristic: a
+   * `_bot`-suffixed / known-bot uid is treated as non-human, any other uid as a
+   * (probable) human. This mirrors the signal cc already trusts for its multi-bot
+   * loop guard and avoids regressing first-time human senders.
+   */
+  private senderIsHuman(channelId: string, uid: string): boolean {
+    const robot = this.isRobotSender?.(channelId, uid);
+    if (robot === true) return false;
+    if (robot === false) return true;
+    return !this.looksLikeBot(uid);
+  }
+
+  /**
+   * F1: read the group's mention pref, fetching on a cache miss. `getMentionPref`
+   * never throws (fails closed to `effective:false`), so the whole path is total.
+   */
+  private async resolveMentionPref(groupNo: string): Promise<MentionPref> {
+    const cached = this.mentionPrefCache!.get(groupNo);
+    if (cached) return cached;
+    const pref = await getMentionPref({
+      apiUrl: this.config.apiUrl,
+      botToken: this.config.botToken,
+      groupNo,
+    });
+    this.mentionPrefCache!.set(groupNo, pref);
+    return pref;
+  }
+
   private async processMessage(msg: BotMessage, key: string): Promise<RouteResult | null> {
     // Skip messages from self.
     if (msg.from_uid === this.robotId) return null;
@@ -545,16 +662,24 @@ export class SessionRouter {
     // were created (owner-gated) and bound to this session; there's no human to
     // @-mention the bot at fire time. Rate limiting below still applies.
     if (this.isGroupLike(msg.channel_type) && !this.isMentioned(msg) && !this.isCronFire(msg)) {
-      // G12: Check if this group is in the mention-free list
-      const isMentionFree = this.config.mentionFreeGroups?.includes(msg.channel_id ?? '') ?? false;
-      if (!isMentionFree) {
+      const channelId = msg.channel_id ?? '';
+      // G12 (legacy): explicit local mention-free list — an operator escape hatch,
+      // kept byte-for-byte. F1: the server-authoritative two-axis pref is the
+      // authoritative replacement and relaxes ONLY for human senders. A group is
+      // treated as mention-free if EITHER the static list contains it OR the
+      // server pref's `effective` is true for a human sender.
+      const staticFree = this.config.mentionFreeGroups?.includes(channelId) ?? false;
+      const serverFree = !staticFree && (await this.isServerMentionFree(msg, channelId));
+      if (!staticFree && !serverFree) {
         return null;
       }
       // Multi-bot loop guard: in a mention-free group there is no @-mention gate
       // to stop one bot from replying to another bot's plain-text message. Drop
       // messages from known/bot-looking uids (unless explicitly whitelisted) so
       // two bots in the same mention-free room cannot enter an unbounded reply
-      // loop. An @-mention still goes through (handled by the branch above).
+      // loop. An @-mention still goes through (handled by the branch above). The
+      // server-pref path already excluded bots (human-only), so this is a
+      // defense-in-depth no-op there; it still guards the static-list path.
       if (this.looksLikeBot(msg.from_uid) && !this.isAllowedBot(msg.from_uid)) {
         return null;
       }
@@ -571,6 +696,7 @@ export class SessionRouter {
     if (msg.payload.event) {
       this.handleGroupMdEvent(msg);
       this.handleThreadMdEvent(msg);
+      this.handleMentionPrefEvent(msg);
       return null;
     }
 
