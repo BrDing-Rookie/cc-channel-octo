@@ -42,6 +42,8 @@ import { handleCommand } from './commands.js';
 import { resolveGroupInstructions } from './group-md.js';
 import { GroupMdCache, ThreadMdCache, DEFAULT_GROUP_MD_TTL_MS } from './group-md-cache.js';
 import { MentionPrefCache, DEFAULT_MENTION_PREF_TTL_MS } from './mention-pref-cache.js';
+import { initPersonaPromptCache, stopPersonaPromptCache, getPersonaPromptForSession } from './persona-prompt.js';
+import { decideOboRelay, type OboRelayDecision } from './obo-relay.js';
 import { GroupMdWriteback, ThreadMdWriteback } from './group-md-writeback.js';
 import { CronStore } from './cron-store.js';
 import { CronScheduler } from './cron-scheduler.js';
@@ -255,6 +257,10 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
   // it to release that lock if a later step throws before return.
   let releaseGatewayLock: (() => void) | undefined;
 
+  // E1: bot id captured after a successful register() so the catch-path cleanup
+  // can stop the persona refresh loop (gateway itself is scoped to the try body).
+  let personaBotId: string | undefined;
+
   // Multi-bot mode no longer exits the process when one bot fails to start, so
   // a failed startBot() must release the durable resources it already acquired
   // (the cwd-cleanup timer, the sqlite handle, and — once register() acquired
@@ -333,6 +339,18 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
     // no message can arrive before the handler below is installed.
     await gateway.register();
     console.log(`[cc-channel-octo] ${label}Bot registered: id=${gateway.botId}`);
+
+    // E1: if this bot is a persona clone (config.onBehalfOf set), start the OBO
+    // grant refresh loop so its grantor's persona_prompt is fetched (once now,
+    // then every ~60s) and injected into the frozen system prompt on each turn.
+    // No-op for a regular bot. Torn down in shutdown() / the catch path.
+    personaBotId = gateway.botId;
+    initPersonaPromptCache({
+      botId: gateway.botId,
+      apiUrl: config.apiUrl,
+      botToken: config.botToken,
+      onBehalfOf: config.onBehalfOf,
+    });
 
     // #115: cron creation/deletion is owner-gated on gateway.ownerUid. If the
     // registration didn't return an owner_uid, the gate can never pass and the
@@ -539,6 +557,7 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
       cronScheduler?.stop();
       cardEventPoller?.stop();
       setCardEventPollStarter(gateway.botId, undefined);
+      stopPersonaPromptCache(gateway.botId);
       await gateway.stop(activeHandlers);
       store.close();
     };
@@ -552,6 +571,7 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
     clearInterval(cwdCleanupTimer);
     cronScheduler?.stop();
     cardEventPoller?.stop();
+    if (personaBotId) stopPersonaPromptCache(personaBotId);
     // register() releases its own lock when IT fails; this covers the window
     // where register() succeeded (lock held) but a later step threw.
     releaseGatewayLock?.();
@@ -587,6 +607,17 @@ export async function handleMessage(
   const channelId = msg.channel_id ?? '';
   const channelType = msg.channel_type ?? ChannelType.DM;
   const isGroup = channelType === ChannelType.Group || channelType === ChannelType.CommunityTopic;
+
+  // E2: OBO v2 relay-envelope decision. Runs BEFORE routing / any session
+  // recording so an irrelevant fan-out (e.g. @AI-only) is dropped with no state
+  // written (state-pollution guard) — mirroring the group non-mention early drop.
+  // Anti-impersonation lives in decideOboRelay: the envelope is trusted only when
+  // the sender IS the configured grantor. A non-OBO message → { isOBOv2:false,
+  // relevant:true } and everything below is unchanged.
+  const oboRelay: OboRelayDecision = decideOboRelay(msg, config.onBehalfOf);
+  if (oboRelay.isOBOv2 && !oboRelay.relevant) {
+    return;
+  }
 
   // --- Route + pipeline under single session lock (no gap between route and processing) ---
   // For non-processed messages, routeAndHandle returns without calling handler.
@@ -1068,9 +1099,17 @@ export async function handleMessage(
       // queryAgent recovers by calling onResumeFailed (clear the bad id) and
       // retrying once with the pre-assembled fallbackRetryPrompt so the
       // conversation isn't lost (and assembly happens exactly once — see above).
-      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; onAgentEvent?: (event: AgentStreamEvent) => void } | undefined = {
+      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; personaHint?: string; onAgentEvent?: (event: AgentStreamEvent) => void } | undefined = {
         ...(resume ? { resume } : {}),
         onSessionId: (id: string) => store.setSdkSessionId(sessionKey, id),
+        // E1: inject the persona-clone hint (grantor's persona_prompt) into the
+        // frozen system prompt when this bot is a persona clone with an active
+        // grant. Read from the OBO-grant cache keyed by this bot's id; undefined
+        // for a regular bot or before the first grant fetch completes.
+        ...((): { personaHint?: string } => {
+          const personaHint = getPersonaPromptForSession(botId);
+          return personaHint ? { personaHint } : {};
+        })(),
         ...(resume
           ? {
               onResumeFailed: () => store.clearSdkSessionId(sessionKey),
@@ -1353,7 +1392,17 @@ export async function handleMessage(
         const isValidMentionUid = isGroup
           ? (uid: string): boolean => groupContext.isMember(channelId, uid)
           : undefined;
-        await streamRelay.deliver(channelId, channelType, teeChunks(), config.apiUrl, config.botToken, config.maxResponseChars, outboundNameToUid, isValidMentionUid);
+        // E2: for a trusted OBO v2 relay, the reply goes to the ORIGIN channel
+        // (not the inbound relay channel) as the configured grantor's persona.
+        // The @name resolution maps are for the inbound channel, so they are
+        // dropped on the OBO path (they don't apply to the origin channel; a
+        // missed @name resolution is a UX nicety, not a correctness/security
+        // concern). effectiveOnBehalfOf is ALWAYS the configured grantor.
+        const deliverChannelId = oboRelay.isOBOv2 ? oboRelay.replyChannelId! : channelId;
+        const deliverChannelType = oboRelay.isOBOv2 ? oboRelay.replyChannelType! : channelType;
+        const deliverNameToUid = oboRelay.isOBOv2 ? undefined : outboundNameToUid;
+        const deliverValidUid = oboRelay.isOBOv2 ? undefined : isValidMentionUid;
+        await streamRelay.deliver(deliverChannelId, deliverChannelType, teeChunks(), config.apiUrl, config.botToken, config.maxResponseChars, deliverNameToUid, deliverValidUid, oboRelay.effectiveOnBehalfOf);
 
         // G8: Send read receipt after processing (fire-and-forget)
         if (msg.message_id && msg.channel_id && msg.channel_type !== undefined) {

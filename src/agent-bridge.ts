@@ -189,14 +189,23 @@ export function buildSystemPrompt(
   customPrompt?: string,
   groupInstructions?: string,
   skillDirs?: { perBot?: string; global?: string },
+  personaHint?: string,
 ): string {
   // parts is SafeText[]: every element must be MINTED by a prompt-safety helper,
   // so a future section that interpolates user text can't be pushed raw — the
   // compiler rejects a plain string here. This is the choke-point enforcement
   // (finding #10): "unsafe text reached the prompt" is now a type error, not a
-  // convention each call site must remember. All three parts are trustedText
-  // (operator-controlled), so the system prompt now carries NO untrusted input.
+  // convention each call site must remember. All parts are trustedText
+  // (operator- / grantor-controlled), so the system prompt carries NO untrusted input.
   const parts: SafeText[] = [trustedText(SECURITY_PROMPT_PREFIX)];
+  if (personaHint) {
+    // E1: persona-clone identity from the bot's OBO grant (delivered over the
+    // authenticated bot token — operator/grantor-trusted, same trust channel as
+    // SOUL). Placed right after the non-overridable security prefix so the persona
+    // frames the bot's identity ahead of SOUL/GROUP.md. Stable turn-to-turn
+    // (refreshed on a ~60s cadence), so it does not break the prompt cache.
+    parts.push(trustedText(personaHint));
+  }
   if (skillDirs?.perBot) {
     const globalNote = skillDirs.global
       ? ` The shared all-bot skill library is ${skillDirs.global}; only modify it when the operator explicitly requests a global installation.`
@@ -270,7 +279,7 @@ export async function* queryAgent(
   config: Config,
   sessionCtx?: SessionCtx,
   onToolUse?: (toolName: string, toolInput?: unknown) => void,
-  opts?: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; onAgentEvent?: (event: AgentStreamEvent) => void },
+  opts?: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; personaHint?: string; onAgentEvent?: (event: AgentStreamEvent) => void },
 ): AsyncIterable<string> {
   const permissionMode = toPermissionMode(config.sdk.permissionMode);
   const settingSources = toSettingSources(config.sdk.settingSources);
@@ -284,6 +293,7 @@ export async function* queryAgent(
     opts?.exposeSkillInstallPaths && settingSources.includes('project')
       ? { perBot: config.skillsDir, global: config.globalSkillsDir }
       : undefined,
+    opts?.personaHint,
   );
 
   // Q3: per-session cwd under cwdBase — creates the directory on first use.
