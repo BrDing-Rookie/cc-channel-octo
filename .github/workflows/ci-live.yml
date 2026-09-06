@@ -1,0 +1,31 @@
+name: CI (live integration)
+
+# Manual-only. This workflow talks to a REAL octo-server with a real bot token,
+# so it MUST NOT run on push or pull_request — only when a maintainer explicitly
+# dispatches it. The regular CI (ci.yml) keeps `npm test` offline: the live suite
+# is gated by OCTO_LIVE and skips itself everywhere OCTO_LIVE is unset.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: Vitest (live roundtrip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Live integration tests
+        env:
+          OCTO_LIVE: '1'
+          OCTO_TEST_API_URL: ${{ secrets.OCTO_TEST_API_URL }}
+          OCTO_TEST_BOT_TOKEN: ${{ secrets.OCTO_TEST_BOT_TOKEN }}
+          OCTO_TEST_GROUP_ID: ${{ secrets.OCTO_TEST_GROUP_ID }}
+        run: npm run test:live
