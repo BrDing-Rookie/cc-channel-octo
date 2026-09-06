@@ -111,6 +111,13 @@ export async function sendMessage(params: {
   mentionAll?: boolean;
   replyMsgId?: string;
   clientMsgNo?: string;
+  /**
+   * E2 (OBO v2): grantor uid to send this message on behalf of. Forwarded as the
+   * wire `on_behalf_of` field so the server routes the reply as the grantor's
+   * persona to the origin channel. Only ever the CONFIGURED grantor
+   * (`config.onBehalfOf`) — never a value taken from an inbound payload.
+   */
+  onBehalfOf?: string;
   signal?: AbortSignal;
 }): Promise<SendMessageResult | undefined> {
   const payload: Record<string, unknown> = {
@@ -142,6 +149,7 @@ export async function sendMessage(params: {
     channel_type: params.channelType,
     payload,
     client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+    ...(params.onBehalfOf ? { on_behalf_of: params.onBehalfOf } : {}),
   }, params.signal);
 }
 

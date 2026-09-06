@@ -429,6 +429,14 @@ export interface Config {
   /** Group IDs where the bot responds without being @mentioned (G12). */
   mentionFreeGroups?: string[];
   /**
+   * E1/E2: grantor uid this bot acts on behalf of (persona clone). When set, the
+   * bot fetches its OBO grant and injects the grantor's `persona_prompt` into the
+   * frozen system prompt (E1), and it is the ONLY uid trusted to drive an OBO v2
+   * relay envelope — a message carrying `obo_*` fields is honored only when
+   * `from_uid === onBehalfOf` (E2 anti-impersonation). Unset = regular bot.
+   */
+  onBehalfOf?: string;
+  /**
    * v0.3 multi-bot: optional per-bot overrides. When present and non-empty, the
    * process runs ONE independent bot per entry, each with its own gateway,
    * router, store, and (by default) data directory — so bots never share history
@@ -484,6 +492,7 @@ export interface BotOverride {
   botBlocklist?: string[];
   allowedBotUids?: string[];
   mentionFreeGroups?: string[];
+  onBehalfOf?: string;
 }
 
 type PartialConfig = {
@@ -508,6 +517,7 @@ type PartialConfig = {
   botBlocklist?: string[];
   allowedBotUids?: string[];
   mentionFreeGroups?: string[];
+  onBehalfOf?: string;
   bots?: BotOverride[];
 };
 
@@ -618,6 +628,7 @@ function mergeConfig(base: Config, override: PartialConfig): Config {
     botBlocklist: override.botBlocklist ?? base.botBlocklist,
     allowedBotUids: override.allowedBotUids ?? base.allowedBotUids,
     mentionFreeGroups: override.mentionFreeGroups ?? base.mentionFreeGroups,
+    onBehalfOf: override.onBehalfOf ?? base.onBehalfOf,
     bots: override.bots ?? base.bots,
   };
 }
@@ -843,6 +854,7 @@ export function resolveBotConfigs(config: Config): Config[] {
       allowedBotUids: perBotFile.allowedBotUids ?? bot.allowedBotUids ?? config.allowedBotUids,
       mentionFreeGroups:
         perBotFile.mentionFreeGroups ?? bot.mentionFreeGroups ?? config.mentionFreeGroups,
+      onBehalfOf: perBotFile.onBehalfOf ?? bot.onBehalfOf ?? config.onBehalfOf,
       groupConfigDir: perBotFile.groupConfigDir ?? config.groupConfigDir,
       serverMd: perBotFile.serverMd ?? config.serverMd,
       serverMdTtlMs: perBotFile.serverMdTtlMs ?? config.serverMdTtlMs,

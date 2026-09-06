@@ -167,6 +167,7 @@ export class StreamRelay {
     maxResponseChars: number = DEFAULT_MAX_RESPONSE_CHARS,
     memberMap?: Map<string, string>,
     isValidUid?: (uid: string) => boolean,
+    onBehalfOf?: string,
   ): Promise<void> {
     // D3 belt-and-suspenders (architect hard gate #2). A doc-task turn must be
     // forked to the doc-comment sink in handleMessage and never reach here — its
@@ -281,6 +282,7 @@ export class StreamRelay {
               ...(segUids.length > 0 ? { mentionUids: segUids } : {}),
               ...(segEntities.length > 0 ? { mentionEntities: segEntities } : {}),
               ...(useMentionAll ? { mentionAll: true } : {}),
+              ...(onBehalfOf ? { onBehalfOf } : {}),
             });
           } catch (err) {
             console.error(`[stream-relay] sendMessage failed for segment (${segment.length} chars), continuing: ${String(err)}`);
