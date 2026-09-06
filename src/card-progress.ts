@@ -399,7 +399,12 @@ async function flush(sessionKey: string): Promise<void> {
   } finally {
     if (entry.flushPromise === work) entry.flushPromise = undefined;
     entry.inFlight = false;
-    if (entry.dirty && !entry.skip && cards.get(sessionKey) === entry &&
+    if (pendingTerminals.has(entry)) {
+      // The entry terminalized (stop/finalize) while this flush was in flight — its
+      // deliverTerminal deferred on inFlight. Now that the send has landed (and any
+      // message_id recorded above), drain the recorded terminal onto the SAME card.
+      void deliverTerminal(entry);
+    } else if (entry.dirty && !entry.skip && cards.get(sessionKey) === entry &&
         cooldownRemainingMs(entry.ctx.apiUrl) === 0) {
       scheduleFlush(sessionKey, entry);
     }
@@ -424,7 +429,13 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         plain,
         signal,
       });
-      if (!isCurrentEntry(sessionKey, entry)) return;
+      // Record the message_id when this entry is still the live card OR has entered
+      // the terminal lifecycle (detached into pendingTerminals because it was stopped/
+      // finalized while this very first-frame send was in flight). Dropping it there
+      // would leave the detached terminal with no messageId → it would send a SECOND
+      // card. Only a stale entry that a NEW turn superseded (and that never
+      // terminalized) discards the response.
+      if (!isCurrentEntry(sessionKey, entry) && !pendingTerminals.has(entry)) return;
       entry.messageId = res?.message_id;
       if (!entry.messageId) {
         warn("placeholder card send returned no message_id; disabling for session");
@@ -519,6 +530,12 @@ async function deliverTerminal(entry: CardEntry): Promise<void> {
   const cooldown = cooldownRemainingMs(entry.ctx.apiUrl);
   if (cooldown > 0) { scheduleTerminalRetry(entry, cooldown); return; }
 
+  // Committed to a send now — cancel any pending retry so a timer firing during the
+  // await cannot spawn a redundant concurrent attempt.
+  if (entry.terminalTimer) {
+    clearTimeout(entry.terminalTimer);
+    entry.terminalTimer = undefined;
+  }
   entry.inFlight = true;
   const signal = AbortSignal.timeout(EDIT_TIMEOUT_MS);
   const state = progressState(entry, entry.terminal.phase, entry.terminal.errorText);

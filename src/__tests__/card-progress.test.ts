@@ -329,6 +329,40 @@ describe("round-2 combination timing", () => {
     expect(termEdit).toBeDefined();
     expect(termEdit![0].transient).toBeUndefined();
   });
+
+  it("dispatch timeout while the FIRST frame is in flight does not double-send; stopped lands via edit on the same card", async () => {
+    // Hold the first (placeholder) send open until we resolve it by hand, so the
+    // dispatch timeout lands while that request is still in flight.
+    let resolveSend: (v: { message_id: string }) => void = () => {};
+    sendCardMessage.mockImplementationOnce(
+      () => new Promise<{ message_id: string }>((res) => { resolveSend = res; }),
+    );
+
+    const h = setCardContext("df", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    // Debounce fires → runFlush starts the placeholder send; it hangs (unresolved).
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+    expect(editCardMessage).not.toHaveBeenCalled();
+
+    // Dispatch timeout arrives mid-flight → markStopped terminalizes + detaches;
+    // deliverTerminal defers because the first-frame send is still inFlight.
+    markStopped(h);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1); // nothing new sent yet
+    expect(editCardMessage).not.toHaveBeenCalled();
+
+    // The original placeholder send finally resolves with its message_id.
+    resolveSend({ message_id: "m1" });
+    await vi.advanceTimersByTimeAsync(600); // flush finally → deliverTerminal → edit
+
+    // Exactly ONE send total; the recorded stopped terminal is an EDIT on that card.
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+    expect(editCardMessage).toHaveBeenCalledTimes(1);
+    const term = editCardMessage.mock.calls[0][0];
+    expect(term.messageId).toBe("m1");
+    expect(term.transient).toBeUndefined();
+    expect(String(term.plain)).toContain("Stopped");
+  });
 });
 
 describe("resolveProgressCardCaps gating", () => {
