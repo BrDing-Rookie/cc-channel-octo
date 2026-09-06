@@ -278,6 +278,17 @@ interface WKSocketOptions {
   onConnected?: () => void;
   onDisconnected?: () => void;
   onError?: (err: Error) => void;
+  /**
+   * Heartbeat (PING) interval in ms. Defaults to 60_000 (the WuKongIM SDK
+   * default). Exposed so integration tests can cross a full PING/PONG cycle in
+   * seconds instead of waiting a real minute; production leaves it unset.
+   */
+  heartbeatIntervalMs?: number;
+  /**
+   * Called each time a server PONG is received. Pure observation hook (tests /
+   * metrics) — the heartbeat keep-alive works with or without it.
+   */
+  onPong?: () => void;
 }
 
 /**
@@ -533,7 +544,7 @@ export class WKSocket extends EventEmitter {
         return;
       }
       this.sendRaw(encodePingPacket());
-    }, 60_000); // 60s heartbeat interval (matches SDK default)
+    }, this.opts.heartbeatIntervalMs ?? 60_000); // 60s heartbeat interval (matches SDK default)
   }
 
   private stopHeart(): void {
@@ -662,6 +673,7 @@ export class WKSocket extends EventEmitter {
 
   private onPong(): void {
     this.pingRetryCount = 0;
+    this.opts.onPong?.();
   }
 
   private onPacket(data: Uint8Array): void {
