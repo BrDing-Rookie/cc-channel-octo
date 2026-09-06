@@ -191,6 +191,25 @@ export interface Config {
      */
     toolProgress?: boolean;
     /**
+     * A6: when true, the bot maintains a single live "progress card" per turn —
+     * an InteractiveCard(=17) that shows a thinking / tool / answering / done
+     * state machine driven off the SDK `query()` stream, edited in place (debounced
+     * + rate-limit cooled). Requires the server D12 profile to advertise
+     * `display_enabled` (fail-closed otherwise). Default false — opt-in, and it is
+     * the richer alternative to `toolProgress`'s per-tool text notices.
+     */
+    progressCard?: boolean;
+    /**
+     * A7 (partial): when true AND `progressCard` is on, the agent's reasoning /
+     * thinking text is captured onto progress steps. Every captured string is
+     * 4-state classified + desensitized (see reasoning-thought.ts) before it is
+     * stored, so a credential-shaped or internal-marker thought is withheld.
+     * Default false (privacy first). The channel-visible reasoning render itself
+     * (server `ai.reasoning-process` template) is deferred; capture is plumbed and
+     * desensitized regardless.
+     */
+    showReasoning?: boolean;
+    /**
      * Q1: Override the upstream Claude API endpoint (e.g. self-hosted gateway).
      * Forwarded to the SDK subprocess via the standard `ANTHROPIC_BASE_URL`
      * environment variable.

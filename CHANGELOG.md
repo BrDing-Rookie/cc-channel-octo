@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A6 — live progress card (`sdk.progressCard`)** — an opt-in InteractiveCard(=17)
+  that shows a single, in-place-edited state machine per turn
+  (thinking → tool → answering → done/error/stopped), rebuilt on the Claude Agent
+  SDK `query()` message stream + `onToolUse` (cc has no lifecycle hooks like
+  OpenClaw). Edits are debounced (800ms) with a monotonic `card_seq` and marked
+  `transient` so mid-frames stay out of the D10 revision history; a 429 opens a
+  per-backend cooldown so discardable progress frames never hammer a bucket the
+  server just closed. The card renders locally via `renderProgressCard` and is
+  gated on the server D12 profile advertising `display_enabled` (fail-closed).
+  Subagent yield/resume has no SDK primitive, so that OpenClaw sub-capability is
+  intentionally skipped (it does not block the main body).
+- **A7 (partial) — reasoning-text desensitization (`sdk.showReasoning`)** — the
+  agent's `thinking` / `redacted_thinking` reasoning lane is captured onto progress
+  steps only when explicitly enabled, and every captured string is 4-state
+  classified + desensitized (`text` / `none` / `no-summary` / `redacted`) before
+  it is ever stored, so credential-shaped or internal-marker reasoning is withheld
+  from a channel-visible card. The channel-visible reasoning RENDER via the server
+  `ai.reasoning-process` template is deferred (see PR notes); the desensitization
+  pipeline is in place and unit-tested regardless.
+
 ## [1.0.3] - 2026-06-26
 
 ### Changed

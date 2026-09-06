@@ -18,6 +18,31 @@ import { linkSkillsIntoSandbox } from './skill-linker.js';
 import { trustedText, escapeSectionMarkers, CURRENT_MESSAGE_ANCHOR } from './prompt-safety.js';
 import type { SafeText } from './prompt-safety.js';
 
+/**
+ * A6: structured events derived from the SDK `query()` message stream, used to
+ * drive the progress-card state machine. This is the cc analogue of OpenClaw's
+ * lifecycle hooks (before/after_tool_call, model_call_started, …), rebuilt on the
+ * SDK surface we actually have: assistant `thinking`/`text`/`tool_use` blocks and
+ * `user` `tool_result` blocks. The bridge stays a pure reporter — it does not
+ * dedup, throttle, or format; the consumer owns all of that.
+ *
+ *   - `thinking`   — a reasoning block. `text` carries readable thinking; a
+ *                    `redacted_thinking` block sets `redacted` with no text; a
+ *                    signed-but-empty thinking block sets `signed`.
+ *   - `tool_start` — a `tool_use` block (the agent is invoking a tool). `id` is
+ *                    the block id, used to pair with the matching `tool_end`.
+ *   - `tool_end`   — a `tool_result` block (the tool returned). `isError` marks a
+ *                    failed call.
+ *   - `text`       — the first/any assistant text block (the agent is answering).
+ *   - `result`     — the terminal result message; `isError` when non-success.
+ */
+export type AgentStreamEvent =
+  | { kind: 'thinking'; text?: string; signed?: boolean; redacted?: boolean }
+  | { kind: 'tool_start'; name: string; input?: unknown; id?: string }
+  | { kind: 'tool_end'; id?: string; isError: boolean }
+  | { kind: 'text' }
+  | { kind: 'result'; isError: boolean; subtype?: string };
+
 
 /**
  * Build the SDK subprocess env overlay. The SDK's `env` option REPLACES the
@@ -245,7 +270,7 @@ export async function* queryAgent(
   config: Config,
   sessionCtx?: SessionCtx,
   onToolUse?: (toolName: string, toolInput?: unknown) => void,
-  opts?: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean },
+  opts?: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; onAgentEvent?: (event: AgentStreamEvent) => void },
 ): AsyncIterable<string> {
   const permissionMode = toPermissionMode(config.sdk.permissionMode);
   const settingSources = toSettingSources(config.sdk.settingSources);
@@ -281,6 +306,17 @@ export async function* queryAgent(
   }
 
   const env = buildSdkEnv(config.sdk, process.env)
+
+  // A6: guarded emitter for the progress-card state machine. A throwing consumer
+  // must never break the SDK stream, so every dispatch is wrapped.
+  const emitAgentEvent = (event: AgentStreamEvent): void => {
+    if (!opts?.onAgentEvent) return;
+    try {
+      opts.onAgentEvent(event);
+    } catch (err) {
+      console.error(`[cc-channel-octo] onAgentEvent callback threw: ${String(err)}`);
+    }
+  };
 
   // Build + iterate the SDK stream for a given resume id and prompt. Extracted so
   // a stale/expired `resume` (the SDK throws "No conversation found with session
@@ -385,20 +421,57 @@ export async function* queryAgent(
           if (content.length > 0) emitted.any = true;
           for (const block of content) {
             if (block.type === 'text' && block.text) {
+              // A6: an assistant text block means the agent is producing its
+              // answer (answering phase). Report before yielding so the state
+              // machine can flip phase in lockstep with the streamed text.
+              emitAgentEvent({ kind: 'text' });
               yield block.text;
-            } else if (block.type === 'tool_use' && onToolUse) {
+            } else if (block.type === 'thinking' || block.type === 'redacted_thinking') {
+              // A6/A7: reasoning lane. A `thinking` block carries readable text
+              // (+ a signature); a `redacted_thinking` block is encrypted with no
+              // readable text. The consumer desensitizes before any display.
+              const b = block as { thinking?: unknown; signature?: unknown };
+              const text = typeof b.thinking === 'string' ? b.thinking : undefined;
+              const signed = typeof b.signature === 'string' && b.signature.length > 0;
+              emitAgentEvent(
+                block.type === 'redacted_thinking'
+                  ? { kind: 'thinking', redacted: true }
+                  : { kind: 'thinking', ...(text ? { text } : {}), ...(signed ? { signed: true } : {}) },
+              );
+            } else if (block.type === 'tool_use') {
               // v0.3 tool progress: report the tool name + its input (so callers
               // can render `<tool>(params)`). Guard the callback so a throw never
               // propagates into the SDK stream and kills the turn.
               const name = typeof block.name === 'string' ? block.name : 'tool';
-              try {
-                onToolUse(name, (block as { input?: unknown }).input);
-              } catch (err) {
-                console.error(`[cc-channel-octo] onToolUse callback threw: ${String(err)}`);
+              const id = typeof (block as { id?: unknown }).id === 'string'
+                ? (block as { id: string }).id
+                : undefined;
+              const input = (block as { input?: unknown }).input;
+              emitAgentEvent({ kind: 'tool_start', name, input, ...(id ? { id } : {}) });
+              if (onToolUse) {
+                try {
+                  onToolUse(name, input);
+                } catch (err) {
+                  console.error(`[cc-channel-octo] onToolUse callback threw: ${String(err)}`);
+                }
               }
             }
           }
+        } else if (message.type === 'user') {
+          // A6: tool results ride on `user` messages as `tool_result` blocks. Pair
+          // them back to the originating `tool_use` by id so the state machine can
+          // close the matching step (done / error).
+          const content = message.message?.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              const b = block as { type?: unknown; tool_use_id?: unknown; is_error?: unknown };
+              if (b.type !== 'tool_result') continue;
+              const id = typeof b.tool_use_id === 'string' ? b.tool_use_id : undefined;
+              emitAgentEvent({ kind: 'tool_end', ...(id ? { id } : {}), isError: b.is_error === true });
+            }
+          }
         } else if (message.type === 'result') {
+          emitAgentEvent({ kind: 'result', isError: message.subtype !== 'success', subtype: message.subtype });
           if (message.subtype !== 'success') {
             yield `\n[Error: ${message.subtype}]`;
           }

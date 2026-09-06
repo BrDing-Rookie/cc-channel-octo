@@ -34,6 +34,13 @@ export interface RouteResult {
    * Add more reasons here when corresponding emit sites land.
    */
   rejectionReason?: 'rate_limited' | 'oversized';
+  /**
+   * #141 + A6: optional hook the handler registers so a dispatch TIMEOUT can settle
+   * per-turn state (e.g. the progress card → "stopped"). Invoked at most once, only
+   * on the timeout branch, before the apology. The handler still runs to completion
+   * in the background (we do not cancel the in-flight turn — see runHandlerWithTimeout).
+   */
+  onDispatchTimeout?: () => void;
 }
 
 interface TokenBucket {
@@ -221,6 +228,15 @@ export class SessionRouter {
       await Promise.race([handlerPromise, timeoutPromise]);
     } catch (err) {
       if (err === timeoutError) {
+        // A6/#141: let the handler settle per-turn state (progress card → stopped)
+        // before we apologize. Best-effort; a throwing hook must not wedge the queue.
+        try {
+          result.onDispatchTimeout?.();
+        } catch (hookErr) {
+          console.error(
+            `session-router: onDispatchTimeout hook threw (session=${result.sessionKey}): ${String(hookErr)}`,
+          );
+        }
         console.warn(
           `session-router: dispatch hung past ${timeoutMs}ms, releasing session lock (session=${result.sessionKey})`,
         );

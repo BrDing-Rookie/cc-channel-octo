@@ -553,6 +553,43 @@ describe('dispatch timeout (#141)', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  it('invokes a handler-registered onDispatchTimeout hook on timeout (A6: card → stopped)', async () => {
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 30 }),
+      ROBOT_ID,
+    );
+    let stopped = false;
+
+    await router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      (result) => {
+        // The handler registers a per-turn stop hook (as index.ts does for the
+        // progress card) and then hangs — the timeout must invoke the hook.
+        result.onDispatchTimeout = () => { stopped = true; };
+        return new Promise<void>(() => { /* never resolves */ });
+      },
+    );
+
+    expect(stopped).toBe(true);
+    // The apology still goes out exactly once alongside the hook.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not invoke onDispatchTimeout for a normal fast handler', async () => {
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 1000 }),
+      ROBOT_ID,
+    );
+    let stopped = false;
+
+    await router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      async (result) => { result.onDispatchTimeout = () => { stopped = true; }; },
+    );
+
+    expect(stopped).toBe(false);
+  });
+
   it('a rejecting handler does not wedge the session (next message still runs)', async () => {
     const router = new SessionRouter(
       makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 1000 }),
