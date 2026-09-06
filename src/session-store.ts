@@ -74,6 +74,17 @@ CREATE TABLE IF NOT EXISTS sdk_sessions (
   updated_at INTEGER NOT NULL
 );
 
+-- G1 (/fork): maps a forked child thread's sessionKey to its PARENT session's
+-- key. A /fork reuses the parent's cwd bucket so the forked SDK session file
+-- (stored under the parent's project dir) stays resumable from the child, while
+-- the child keeps its own history/memory/routing. Separate table, no FK: it must
+-- outlive the child's own session lifecycle and survive a process restart.
+CREATE TABLE IF NOT EXISTS forked_sessions (
+  child_session_id TEXT PRIMARY KEY,
+  parent_session_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
 `;
 
@@ -105,6 +116,8 @@ export class SessionStore {
   private selectSdkSession!: PreparedStatement;
   private deleteSdkSession!: PreparedStatement;
   private deleteExpiredSdkSessions!: PreparedStatement;
+  private upsertForkParent!: PreparedStatement;
+  private selectForkParent!: PreparedStatement;
 
   /** Tracks the last message_seq at which the bot replied, per group session key. */
   private lastBotReplySeq = new Map<string, number>();
@@ -202,6 +215,14 @@ export class SessionStore {
     );
     this.deleteExpiredSdkSessions = this.adapter.prepare(
       'DELETE FROM sdk_sessions WHERE updated_at < ?',
+    );
+    this.upsertForkParent = this.adapter.prepare(
+      'INSERT INTO forked_sessions (child_session_id, parent_session_id, created_at) VALUES (?, ?, ?) ' +
+        'ON CONFLICT(child_session_id) DO UPDATE SET parent_session_id = excluded.parent_session_id, ' +
+        'created_at = excluded.created_at',
+    );
+    this.selectForkParent = this.adapter.prepare(
+      'SELECT parent_session_id FROM forked_sessions WHERE child_session_id = ?',
     );
   }
 
@@ -388,6 +409,27 @@ export class SessionStore {
   /** Forget the SDK session mapping (e.g. on /reset or a resume failure). */
   clearSdkSessionId(sessionId: string): void {
     this.deleteSdkSession.run(sessionId);
+  }
+
+  /**
+   * G1 (/fork): record that `childSessionId` (a new thread) is a fork of
+   * `parentSessionId`, so later turns resolve the child's cwd to the PARENT's
+   * bucket (where the forked SDK session file lives). Upsert (latest wins).
+   */
+  setForkParent(childSessionId: string, parentSessionId: string): void {
+    this.upsertForkParent.run(childSessionId, parentSessionId, Date.now());
+  }
+
+  /**
+   * G1 (/fork): the parent sessionKey a forked child anchors its cwd to, or
+   * undefined for a normal (non-forked) session. Read on every turn to decide
+   * cwd partitioning — a cheap indexed lookup.
+   */
+  getForkParent(childSessionId: string): string | undefined {
+    const row = this.selectForkParent.get(childSessionId) as
+      | { parent_session_id: string }
+      | undefined;
+    return row?.parent_session_id;
   }
 
   close(): void {

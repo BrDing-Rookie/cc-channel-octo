@@ -16,6 +16,7 @@ import { OctoGateway } from './gateway.js';
 import { SessionRouter } from './session-router.js';
 import { GroupContext } from './group-context.js';
 import { queryAgent } from './agent-bridge.js';
+import { forkSdkSession } from './agent-bridge.js';
 import type { AgentStreamEvent } from './agent-bridge.js';
 import {
   setCardContext,
@@ -32,13 +33,14 @@ import { sanitizeDisplayName, escapeSectionMarkers, sanitizePromptBody, formatSe
 import type { SessionCtx } from './cwd-resolver.js';
 import { cleanupExpiredCwds, resolveMemoryDir, resolveSessionCwd } from './cwd-resolver.js';
 import { StreamRelay } from './stream-relay.js';
-import { sendMessage, sendReadReceipt, getChannelMessages, getUploadCredentials } from './octo/api.js';
+import { sendMessage, sendReadReceipt, getChannelMessages, getUploadCredentials, createThread } from './octo/api.js';
 import type { HistoricalMessage } from './octo/api.js';
 import { ChannelType, MessageType } from './octo/types.js';
 import type { BotMessage } from './octo/types.js';
 import { resolveContent, tryResolveFile, resolveHistoricalMessagePlaceholder } from './inbound.js';
 import { downloadInboundImage, MAX_IMAGES_PER_MESSAGE } from './media-inbound.js';
-import { handleCommand } from './commands.js';
+import { handleCommand, parseCommand, handleForkCommand } from './commands.js';
+import type { CommandResult } from './commands.js';
 import { resolveGroupInstructions } from './group-md.js';
 import { GroupMdCache, ThreadMdCache, DEFAULT_GROUP_MD_TTL_MS } from './group-md-cache.js';
 import { MentionPrefCache, DEFAULT_MENTION_PREF_TTL_MS } from './mention-pref-cache.js';
@@ -102,6 +104,7 @@ import {
   type GroupMdSessionCoords,
 } from './group-md-tool.js';
 import { isThreadChannelId } from './octo/channel-id.js';
+import { emitAuditLog } from './audit.js';
 import { buildInlinedFileBody, truncateUtf8ByBytes, assembleUserMessage, MAX_USER_LLM_BYTES } from './file-inline-wrap.js';
 import { join } from 'node:path';
 import { mkdirSync, realpathSync } from 'node:fs';
@@ -671,6 +674,16 @@ export async function handleMessage(
         sessionKey,
       };
 
+      // G1 (/fork): a forked child thread reuses its PARENT's cwd bucket so the
+      // forked SDK session file (stored under the parent's project dir) stays
+      // resumable from the child. Only cwd/media sandbox is anchored to the
+      // parent; history, memory, group-context, and routing keep the child's own
+      // key. A normal (non-forked) session resolves to itself.
+      const forkParentKey = store.getForkParent(sessionKey);
+      const cwdCtx: SessionCtx = forkParentKey
+        ? { kind: 'group', sessionKey: forkParentKey }
+        : sessionCtx;
+
       // --- v0.3: in-chat slash commands (/reset, /config, /help) ---
       // Handled before group-context caching, history append, and the agent
       // query — so a command never reaches the LLM, is not stored as a turn,
@@ -681,7 +694,55 @@ export async function handleMessage(
       // history (any member can — by the shared-workspace design) and does NOT
       // clear long-term memory. See commands.ts.
       if (result.cleanContent !== undefined) {
-        const command = handleCommand(result.cleanContent, sessionKey, store, config, msg.message_seq);
+        // G1: `/fork` needs async work (create-thread + SDK session fork) and
+        // extra context (channel coords, owner uid, cwd), so it is handled by a
+        // dedicated async handler intercepted here BEFORE the synchronous
+        // handleCommand. All other commands stay on the sync path unchanged.
+        const parsedCmd = parseCommand(result.cleanContent);
+        let command: CommandResult;
+        if (parsedCmd?.name === 'fork') {
+          command = await handleForkCommand({
+            args: parsedCmd.args,
+            parentSessionKey: sessionKey,
+            parentAnchorKey: forkParentKey ?? sessionKey,
+            channelId,
+            isGroup,
+            requesterUid: msg.from_uid ?? '',
+            ownerUid: router.getOwnerUid(),
+            octoManagementEnabled: config.sdk.octoManagement === true,
+            botToken: config.botToken,
+            parentCwd: resolveSessionCwd(config.cwdBase ?? config.cwd, cwdCtx),
+            store,
+            createThread: async (groupNo, name) => {
+              try {
+                const t = await createThread({
+                  apiUrl: config.apiUrl,
+                  botToken: config.botToken,
+                  groupNo,
+                  name,
+                  ...(msg.message_id ? { sourceMessageId: String(msg.message_id) } : {}),
+                  signal: AbortSignal.timeout(30_000),
+                });
+                return t ? { shortId: t.short_id, name: t.name } : null;
+              } catch (err) {
+                console.error(`[cc-channel-octo] /fork createThread failed: ${String(err)}`);
+                return null;
+              }
+            },
+            forkSdkSession,
+            audit: (auditResult, reason) =>
+              emitAuditLog({
+                action: 'fork',
+                requester: msg.from_uid ?? '',
+                target: channelId,
+                channelType,
+                result: auditResult,
+                ...(reason ? { reason } : {}),
+              }),
+          });
+        } else {
+          command = handleCommand(result.cleanContent, sessionKey, store, config, msg.message_seq);
+        }
         if (command.handled) {
           if (command.reply) {
             await sendMessage({
@@ -777,7 +838,7 @@ export async function handleMessage(
         }
         if (imageUrls.length > 0) {
           const cwdBase = config.cwdBase ?? config.cwd;
-          const cwdDir = resolveSessionCwd(cwdBase, sessionCtx);
+          const cwdDir = resolveSessionCwd(cwdBase, cwdCtx);
           const localPaths: string[] = [];
           for (const url of imageUrls.slice(0, MAX_IMAGES_PER_MESSAGE)) {
             try {
@@ -1251,7 +1312,7 @@ export async function handleMessage(
         const coords: MediaSendSessionCoords = {
           channelId,
           channelType,
-          cwdDir: resolveSessionCwd(config.cwdBase ?? config.cwd, sessionCtx),
+          cwdDir: resolveSessionCwd(config.cwdBase ?? config.cwd, cwdCtx),
         };
         const mediaSendServer = createMediaSendToolServer(
           { apiUrl: config.apiUrl, botToken: config.botToken },
@@ -1313,7 +1374,7 @@ export async function handleMessage(
           channelId,
           requesterUid: msg.from_uid ?? '',
           ownerUid: router.getOwnerUid(),
-          cwdDir: resolveSessionCwd(config.cwdBase ?? config.cwd, sessionCtx),
+          cwdDir: resolveSessionCwd(config.cwdBase ?? config.cwd, cwdCtx),
         };
         const octoSecretServer = createOctoSecretToolServer(
           { apiUrl: config.apiUrl, botToken: config.botToken, secretsFileRoot: config.sdk.secretsFileRoot },
