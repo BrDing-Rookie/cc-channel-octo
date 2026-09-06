@@ -42,6 +42,7 @@ import {
   type InteractiveCardSpec,
 } from './card-author.js';
 import { registerCardSession } from './card-session.js';
+import { docTaskImEgressBlockReason } from './doc-task-scope.js';
 import {
   deriveInteractiveCardCaps,
   generateClientMsgNo,
@@ -240,6 +241,10 @@ export function buildInteractiveCardTools(
           if (!coords.channelId || !coords.channelId.trim()) {
             return errResult('the current Octo delivery channel is unavailable');
           }
+          // D3 egress fail-closed: a doc-task session binds to a non-routable
+          // sentinel channel, so a card would post into IM (or a bogus channel).
+          const docTaskBlock = docTaskImEgressBlockReason(coords.channelId, INTERACTIVE_CARD_TOOL_NAME);
+          if (docTaskBlock) return errResult(docTaskBlock);
           const spec: InteractiveCardSpec = {
             title: typeof args.title === 'string' ? args.title : '',
             ...(typeof args.text === 'string' ? { text: args.text } : {}),

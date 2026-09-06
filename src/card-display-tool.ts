@@ -35,6 +35,7 @@ import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import type { ChannelType } from './octo/types.js';
 import { CARD_PROFILE, CARD_VERSION } from './octo/types.js';
 import { buildDisplayCard, validateDisplayBlocks } from './card-blocks.js';
+import { docTaskImEgressBlockReason } from './doc-task-scope.js';
 import {
   getCardProfile,
   deriveCardCaps,
@@ -154,6 +155,10 @@ export function buildDisplayCardTools(
           if (!coords.channelId || !coords.channelId.trim()) {
             return errResult('the current Octo delivery channel is unavailable');
           }
+          // D3 egress fail-closed: a doc-task session binds to a non-routable
+          // sentinel channel, so a card would post into IM (or a bogus channel).
+          const docTaskBlock = docTaskImEgressBlockReason(coords.channelId, DISPLAY_CARD_TOOL_NAME);
+          if (docTaskBlock) return errResult(docTaskBlock);
           const validated = validateDisplayBlocks(args.blocks);
           const rawTitle = typeof args.title === 'string' ? args.title : '';
 

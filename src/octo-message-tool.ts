@@ -41,6 +41,7 @@ import {
 } from "./permission.js";
 import { emitAuditLog, wrapUntrustedContent } from "./audit.js";
 import { resolveMentions } from "./mention-utils.js";
+import { docTaskImEgressBlockReason } from "./doc-task-scope.js";
 
 /** MCP server name; the tool surfaces as `mcp__octo_message__octo_message`. */
 export const OCTO_MESSAGE_TOOL_SERVER_NAME = "octo_message";
@@ -177,6 +178,14 @@ export function buildOctoMessageTools(
           .describe('For action="read": max messages to return (default 20).'),
       },
       async (args) => {
+        // D3 egress fail-closed: refuse by SESSION context, before any network
+        // call. The send target comes from attacker-controlled tool args and can
+        // never be trusted; the one input an injected doc comment cannot forge is
+        // which session is running. Blocks both send and read — reading another
+        // channel's history into a doc task is exfiltration too.
+        const docTaskBlock = docTaskImEgressBlockReason(coords.channelId, OCTO_MESSAGE_TOOL_NAME);
+        if (docTaskBlock) return errResult(docTaskBlock);
+
         const bad = guardConfigured();
         if (bad) return errResult(bad);
 

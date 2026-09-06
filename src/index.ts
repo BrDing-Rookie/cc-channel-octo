@@ -1168,6 +1168,7 @@ export async function handleMessage(
       // limited to the owner and audited. Gated behind sdk.octoManagement (off).
       if (config.sdk.octoManagement && config.botToken && config.apiUrl) {
         const coords: OctoManagementSessionCoords = {
+          channelId,
           requesterUid: msg.from_uid ?? '',
           ownerUid: router.getOwnerUid(),
         };
