@@ -9,7 +9,7 @@
  * as system context, conversation history, or assistant output.
  */
 
-import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
+import { query as sdkQuery, forkSession as sdkForkSession } from '@anthropic-ai/claude-agent-sdk';
 import type { PermissionMode, SettingSource, Settings, McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import type { Config } from './config.js';
 import { resolveSessionCwd } from './cwd-resolver.js';
@@ -17,6 +17,34 @@ import type { SessionCtx } from './cwd-resolver.js';
 import { linkSkillsIntoSandbox } from './skill-linker.js';
 import { trustedText, escapeSectionMarkers, CURRENT_MESSAGE_ANCHOR } from './prompt-safety.js';
 import type { SafeText } from './prompt-safety.js';
+
+/**
+ * G1 (/fork): fork an existing SDK session into a new branch, returning the new
+ * session UUID (resumable via `query({ resume })`). The parent session is left
+ * untouched — the fork copies its transcript into a fresh session id.
+ *
+ * `dir` MUST be the SOURCE session's project cwd: the SDK stores sessions per
+ * project directory (`~/.claude/projects/<encoded-cwd>/`), so the fork is written
+ * into that same bucket. cc's `/fork` therefore anchors the new thread's cwd to
+ * the parent's bucket (see cwd-resolver / index.ts) so the forked file stays
+ * resumable from the child thread.
+ *
+ * Best-effort: any failure (missing source session, SDK error) returns null so
+ * `/fork` can degrade to a fresh thread instead of throwing into the turn.
+ */
+export async function forkSdkSession(
+  parentSdkSessionId: string,
+  dir: string,
+): Promise<string | null> {
+  try {
+    const res = await sdkForkSession(parentSdkSessionId, { dir });
+    return res?.sessionId ?? null;
+  } catch (err) {
+    console.error(`[cc-channel-octo] forkSdkSession failed: ${String(err)}`);
+    return null;
+  }
+}
+
 
 /**
  * A6: structured events derived from the SDK `query()` message stream, used to

@@ -46,6 +46,28 @@ export type SessionCtx = {
   sessionKey: string;
 };
 
+/**
+ * G1 (/fork): choose the SessionCtx used for CWD resolution. A forked child
+ * thread must resolve its cwd — and thus the SDK session project bucket that
+ * `resume` reads — to its PARENT's bucket, where `forkSession` wrote the forked
+ * transcript. Anchoring only cwd (this helper) keeps history, memory, and
+ * routing on the child's own key; a mismatched ctx here would make the child's
+ * first turn silently miss the fork. A non-forked session (no parent anchor)
+ * resolves to its own ctx unchanged.
+ *
+ * The parent anchor is always a group/thread (a /fork requires a group), so the
+ * anchored ctx uses `kind: 'group'` — matching how the group cwd is hashed.
+ *
+ * @param ownCtx        the session's own ctx (kind + child sessionKey)
+ * @param forkParentKey `SessionStore.getForkParent(sessionKey)` — the anchor key, or undefined
+ */
+export function deriveForkCwdCtx(
+  ownCtx: SessionCtx,
+  forkParentKey: string | undefined,
+): SessionCtx {
+  return forkParentKey ? { kind: 'group', sessionKey: forkParentKey } : ownCtx;
+}
+
 /** Length of the hex prefix used for subdirectory names. 16 hex = 64 bits — */
 /** ~2^32 sessions before a 1% collision risk, ample headroom for IM use.    */
 const HASH_HEX_LEN = 16;

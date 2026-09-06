@@ -1,7 +1,6 @@
 ---
 name: octo-bot-api
 description: How a cc-channel-octo bot talks to Octo — send/read messages, discover and manage groups/threads/members, send images/files, and write GROUP.md/THREAD.md. In cc the gateway owns the connection (register, WebSocket, heartbeat, event routing, reply targeting); you act through in-process MCP tools that surface as `mcp__*`, not raw HTTP. Use openclaw-channel-octo's octo-bot-api only as a functional reference.
-metadata: {"octo":{"category":"messaging","runtime":"cc-channel-octo"}}
 ---
 
 # Octo Bot Skill (cc-channel-octo)
