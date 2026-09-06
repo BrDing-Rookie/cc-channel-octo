@@ -13,6 +13,7 @@ import {
   setCardContext,
   handleAgentEvent,
   finalizeCard,
+  markStopped,
   resolveProgressCardCaps,
   _resetProgressCardsForTests,
   _resetProgressCapsCacheForTests,
@@ -42,20 +43,20 @@ afterEach(() => {
 
 describe("card-progress state machine", () => {
   it("lazily sends the placeholder only after a real tool step, then edits", async () => {
-    setCardContext("s1", CTX);
+    const h = setCardContext("s1", CTX);
     // Pure thinking must NOT send a card yet.
-    handleAgentEvent("s1", { kind: "thinking", text: "planning" });
+    handleAgentEvent(h, { kind: "thinking", text: "planning" });
     await vi.advanceTimersByTimeAsync(900);
     expect(sendCardMessage).not.toHaveBeenCalled();
 
     // First tool → debounced send.
-    handleAgentEvent("s1", { kind: "tool_start", name: "Read", input: { path: "a.ts" }, id: "t1" });
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: { path: "a.ts" }, id: "t1" });
     await vi.advanceTimersByTimeAsync(900);
     expect(sendCardMessage).toHaveBeenCalledTimes(1);
 
     // Tool end + a second tool → edit in place with a monotonic, transient frame.
-    handleAgentEvent("s1", { kind: "tool_end", id: "t1", isError: false });
-    handleAgentEvent("s1", { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
+    handleAgentEvent(h, { kind: "tool_end", id: "t1", isError: false });
+    handleAgentEvent(h, { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
     await vi.advanceTimersByTimeAsync(900);
     expect(editCardMessage).toHaveBeenCalledTimes(1);
     const editArgs = editCardMessage.mock.calls[0][0];
@@ -65,68 +66,190 @@ describe("card-progress state machine", () => {
   });
 
   it("finalize edits a recorded (non-transient) terminal frame", async () => {
-    setCardContext("s2", CTX);
-    handleAgentEvent("s2", { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    const h = setCardContext("s2", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
     await vi.advanceTimersByTimeAsync(900);
-    handleAgentEvent("s2", { kind: "tool_end", id: "t1", isError: false });
-    await finalizeCard("s2", { success: true });
+    handleAgentEvent(h, { kind: "tool_end", id: "t1", isError: false });
+    await finalizeCard(h, { success: true });
     const last = editCardMessage.mock.calls.at(-1)![0];
     expect(last.transient).toBeUndefined();
     expect(last.cardSeq).toBeGreaterThanOrEqual(1);
   });
 
   it("sends no card for a pure-text turn", async () => {
-    setCardContext("s3", CTX);
-    handleAgentEvent("s3", { kind: "text" });
+    const h = setCardContext("s3", CTX);
+    handleAgentEvent(h, { kind: "text" });
     await vi.advanceTimersByTimeAsync(900);
-    await finalizeCard("s3", { success: true });
+    await finalizeCard(h, { success: true });
     expect(sendCardMessage).not.toHaveBeenCalled();
     expect(editCardMessage).not.toHaveBeenCalled();
   });
 
   it("emits a terminal card even when the debounce never fired (fast tool turn)", async () => {
-    setCardContext("s4", CTX);
-    handleAgentEvent("s4", { kind: "tool_start", name: "Read", input: {}, id: "t1" });
-    handleAgentEvent("s4", { kind: "tool_end", id: "t1", isError: false });
+    const h = setCardContext("s4", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    handleAgentEvent(h, { kind: "tool_end", id: "t1", isError: false });
     // No timer advance: finalize before the 800ms debounce.
-    await finalizeCard("s4", { success: true });
+    await finalizeCard(h, { success: true });
     expect(sendCardMessage).toHaveBeenCalledTimes(1);
   });
 
   it("opens a cooldown on 429 and stops sending frames within the window", async () => {
     sendCardMessage.mockRejectedValueOnce(new Error("Octo API /v1/bot/sendMessage failed (429): slow down"));
-    setCardContext("s5", CTX);
-    handleAgentEvent("s5", { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    const h = setCardContext("s5", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
     await vi.advanceTimersByTimeAsync(900);
     expect(sendCardMessage).toHaveBeenCalledTimes(1); // the rejected attempt
 
     // Another event during the cooldown must not fire a new send.
-    handleAgentEvent("s5", { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
+    handleAgentEvent(h, { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
     await vi.advanceTimersByTimeAsync(900);
     expect(sendCardMessage).toHaveBeenCalledTimes(1);
   });
 
   it("disables the session on a deterministic 4xx (not 429)", async () => {
     sendCardMessage.mockRejectedValueOnce(new Error("Octo API /v1/bot/sendMessage failed (400): bad card"));
-    setCardContext("s6", CTX);
-    handleAgentEvent("s6", { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    const h = setCardContext("s6", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
     await vi.advanceTimersByTimeAsync(900);
     // Subsequent events + finalize produce no further network calls.
-    handleAgentEvent("s6", { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
+    handleAgentEvent(h, { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
     await vi.advanceTimersByTimeAsync(900);
-    await finalizeCard("s6", { success: true });
+    await finalizeCard(h, { success: true });
     expect(sendCardMessage).toHaveBeenCalledTimes(1);
     expect(editCardMessage).not.toHaveBeenCalled();
   });
 
   it("a superseding turn on the same session does not disturb the new card", async () => {
-    setCardContext("s7", CTX);
-    handleAgentEvent("s7", { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    const h1 = setCardContext("s7", CTX);
+    handleAgentEvent(h1, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
     // New turn before the first flush.
-    setCardContext("s7", CTX);
-    handleAgentEvent("s7", { kind: "tool_start", name: "Bash", input: {}, id: "t9" });
+    const h2 = setCardContext("s7", CTX);
+    handleAgentEvent(h2, { kind: "tool_start", name: "Bash", input: {}, id: "t9" });
     await vi.advanceTimersByTimeAsync(900);
     expect(sendCardMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("turn-generation isolation (dispatch timeout → new turn)", () => {
+  it("a timed-out old turn's late stream + finalize never touch the new turn's card", async () => {
+    // Turn 1 starts, sends its card, then its dispatch "times out": the handler
+    // keeps running in the background while a NEW turn (same session) starts.
+    const h1 = setCardContext("iso", CTX);
+    handleAgentEvent(h1, { kind: "tool_start", name: "Read", input: {}, id: "a1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1); // turn 1's placeholder (m1)
+
+    // New turn on the same session (dispatch released the lock, turn 1 still alive).
+    sendCardMessage.mockResolvedValueOnce({ message_id: "m2" });
+    const h2 = setCardContext("iso", CTX);
+    handleAgentEvent(h2, { kind: "tool_start", name: "Grep", input: {}, id: "b1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(2);
+    expect(sendCardMessage.mock.calls[1][0].channelId).toBe(CTX.channelId);
+
+    editCardMessage.mockClear();
+    // Turn 1's ORPHANED stream keeps producing — must NOT edit turn 2's card (m2).
+    handleAgentEvent(h1, { kind: "thinking", text: "late" });
+    handleAgentEvent(h1, { kind: "tool_start", name: "OldTool", input: {}, id: "a2" });
+    handleAgentEvent(h1, { kind: "tool_end", id: "a2", isError: false });
+    await vi.advanceTimersByTimeAsync(900);
+    // And turn 1's own finalize must not terminate turn 2's card.
+    await finalizeCard(h1, { success: true });
+    expect(editCardMessage).not.toHaveBeenCalled();
+
+    // Turn 2 still owns its card: its own edits/finalize land on m2.
+    handleAgentEvent(h2, { kind: "tool_end", id: "b1", isError: false });
+    await finalizeCard(h2, { success: true });
+    const edits = editCardMessage.mock.calls;
+    expect(edits.length).toBeGreaterThanOrEqual(1);
+    expect(edits.every((c) => c[0].messageId === "m2")).toBe(true);
+  });
+});
+
+describe("terminal-state correctness", () => {
+  it("a non-success SDK result settles the card as error, not done", async () => {
+    const h = setCardContext("err", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Bash", input: {}, id: "t1" });
+    handleAgentEvent(h, { kind: "tool_end", id: "t1", isError: true });
+    // The SDK reports a non-success terminal result (e.g. max turns exhausted).
+    handleAgentEvent(h, { kind: "result", isError: true, subtype: "error_max_turns" });
+    // Dispatcher finalizes on normal generator completion with success:true — the
+    // error result must still win.
+    await finalizeCard(h, { success: true });
+    const last = editCardMessage.mock.calls.at(-1)?.[0] ?? sendCardMessage.mock.calls.at(-1)![0];
+    expect(last.card).toBeDefined();
+    // The rendered terminal reflects the error result ("⚠️ Interrupted"), not "✅ Done".
+    expect(String(last.plain)).toContain("Interrupted");
+    expect(String(last.plain)).not.toContain("Done");
+  });
+
+  it("a stopped (dispatch-timeout) turn settles the card as stopped and freezes intake", async () => {
+    const h = setCardContext("stp", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+
+    // Dispatch timeout marks the turn stopped; the background stream keeps going.
+    markStopped(h);
+    editCardMessage.mockClear();
+    handleAgentEvent(h, { kind: "tool_start", name: "LateTool", input: {}, id: "t2" });
+    handleAgentEvent(h, { kind: "text" });
+    await vi.advanceTimersByTimeAsync(900);
+
+    // The eventual finalize records a stopped terminal, not done.
+    await finalizeCard(h, { success: true });
+    const last = editCardMessage.mock.calls.at(-1)![0];
+    expect(last.transient).toBeUndefined();
+    expect(String(last.plain)).toContain("Stopped");
+    expect(String(last.plain)).not.toContain("Done");
+  });
+});
+
+describe("terminal frame honors the 429 cooldown", () => {
+  it("first send ok → edit 429 → finalize holds the terminal until the window clears, then records it", async () => {
+    const h = setCardContext("cd", CTX);
+    // First frame sends successfully (m1).
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+
+    // Next edit is rate-limited → opens the cooldown window.
+    editCardMessage.mockRejectedValueOnce(new Error("Octo API /v1/bot/editMessage failed (429): slow down"));
+    handleAgentEvent(h, { kind: "tool_start", name: "Grep", input: {}, id: "t2" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(editCardMessage).toHaveBeenCalledTimes(1); // the rejected attempt
+
+    // finalize DURING the cooldown must NOT append a request immediately.
+    editCardMessage.mockClear();
+    handleAgentEvent(h, { kind: "tool_end", id: "t2", isError: false });
+    await finalizeCard(h, { success: true });
+    expect(editCardMessage).not.toHaveBeenCalled();
+
+    // Once the window clears, the held terminal frame is flushed exactly once and
+    // RECORDED (non-transient).
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(editCardMessage).toHaveBeenCalledTimes(1);
+    expect(editCardMessage.mock.calls[0][0].transient).toBeUndefined();
+  });
+
+  it("a second 429 on the terminal frame is retried (not lost) after the window", async () => {
+    const h = setCardContext("cd2", CTX);
+    handleAgentEvent(h, { kind: "tool_start", name: "Read", input: {}, id: "t1" });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(sendCardMessage).toHaveBeenCalledTimes(1);
+
+    // Terminal edit is 429'd → held, re-armed for the next window instead of dropped.
+    editCardMessage.mockRejectedValueOnce(new Error("Octo API /v1/bot/editMessage failed (429): slow down"));
+    handleAgentEvent(h, { kind: "tool_end", id: "t1", isError: false });
+    await finalizeCard(h, { success: true });
+    expect(editCardMessage).toHaveBeenCalledTimes(1);
+
+    // Window clears → the terminal frame is retried and lands (recorded).
+    editCardMessage.mockClear();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(editCardMessage).toHaveBeenCalledTimes(1);
+    expect(editCardMessage.mock.calls[0][0].transient).toBeUndefined();
   });
 });
 

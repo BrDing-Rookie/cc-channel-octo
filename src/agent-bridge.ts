@@ -41,7 +41,7 @@ export type AgentStreamEvent =
   | { kind: 'tool_start'; name: string; input?: unknown; id?: string }
   | { kind: 'tool_end'; id?: string; isError: boolean }
   | { kind: 'text' }
-  | { kind: 'result'; isError: boolean };
+  | { kind: 'result'; isError: boolean; subtype?: string };
 
 
 /**
@@ -471,7 +471,7 @@ export async function* queryAgent(
             }
           }
         } else if (message.type === 'result') {
-          emitAgentEvent({ kind: 'result', isError: message.subtype !== 'success' });
+          emitAgentEvent({ kind: 'result', isError: message.subtype !== 'success', subtype: message.subtype });
           if (message.subtype !== 'success') {
             yield `\n[Error: ${message.subtype}]`;
           }

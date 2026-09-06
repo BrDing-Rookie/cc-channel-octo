@@ -21,8 +21,10 @@ import {
   setCardContext,
   handleAgentEvent,
   finalizeCard,
+  markStopped,
   resolveProgressCardCaps,
 } from './card-progress.js';
+import type { CardHandle } from './card-progress.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import { sanitizeDisplayName, escapeSectionMarkers, sanitizePromptBody, formatSenderLabel } from './prompt-safety.js';
 import type { SessionCtx } from './cwd-resolver.js';
@@ -527,6 +529,9 @@ export async function handleMessage(
     const { sessionKey } = result;
     // A6: declared outside the try so the catch can settle the progress card too.
     let progressCardOn = false;
+    // A6: turn-level handle for the progress card; fences every event/finalize/stop
+    // to THIS turn's generation (a superseded turn no-ops against the new card).
+    let cardHandle: CardHandle | undefined;
 
     try {
       // --- Session ---
@@ -947,7 +952,7 @@ export async function handleMessage(
         const { enabled, caps } = await resolveProgressCardCaps(config.apiUrl, config.botToken);
         if (enabled) {
           progressCardOn = true;
-          setCardContext(sessionKey, {
+          cardHandle = setCardContext(sessionKey, {
             apiUrl: config.apiUrl,
             botToken: config.botToken,
             channelId,
@@ -955,6 +960,12 @@ export async function handleMessage(
             ...(caps ? { caps } : {}),
             ...(config.sdk.showReasoning ? { showReasoning: true } : {}),
           });
+          // #141 + A6: if the dispatch times out, the SDK stream keeps running in
+          // the background (session-router does not cancel it) — settle THIS turn's
+          // card into "stopped" so it isn't left spinning. Fenced by generation, so
+          // a later turn's card is untouched.
+          const stopHandle = cardHandle;
+          result.onDispatchTimeout = () => markStopped(stopHandle);
         }
       }
 
@@ -979,10 +990,11 @@ export async function handleMessage(
       };
 
       // A6: forward SDK stream events to the progress-card state machine.
-      if (progressCardOn) {
+      if (progressCardOn && cardHandle) {
+        const evHandle = cardHandle;
         sessionOpts = {
           ...(sessionOpts ?? {}),
-          onAgentEvent: (event: AgentStreamEvent) => handleAgentEvent(sessionKey, event),
+          onAgentEvent: (event: AgentStreamEvent) => handleAgentEvent(evHandle, event),
         };
       }
 
@@ -1257,16 +1269,18 @@ export async function handleMessage(
         });
       }
 
-      // A6: settle the progress card into its terminal (done) frame.
-      if (progressCardOn) {
-        await finalizeCard(sessionKey, { success: true });
+      // A6: settle the progress card into its terminal frame. A non-success SDK
+      // result already flipped the card to "error" (onResult), so finalize honors
+      // that even though we pass success:true for the normal generator-completed path.
+      if (progressCardOn && cardHandle) {
+        await finalizeCard(cardHandle, { success: true });
       }
 
     } catch (err) {
       // A6: settle the progress card into its terminal (error) frame before the
       // user-facing error reply.
-      if (progressCardOn) {
-        await finalizeCard(sessionKey, { success: false, errorText: String(err) }).catch(() => {
+      if (progressCardOn && cardHandle) {
+        await finalizeCard(cardHandle, { success: false, errorText: String(err) }).catch(() => {
           /* finalize is best-effort; never mask the original error */
         });
       }

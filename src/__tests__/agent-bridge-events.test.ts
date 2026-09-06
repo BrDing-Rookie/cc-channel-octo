@@ -58,7 +58,7 @@ describe("queryAgent onAgentEvent", () => {
       { kind: "tool_start", name: "Read", input: { path: "a.ts" }, id: "t1" },
       { kind: "tool_end", id: "t1", isError: false },
       { kind: "text" },
-      { kind: "result", isError: false },
+      { kind: "result", isError: false, subtype: "success" },
     ]);
   });
 
@@ -80,6 +80,6 @@ describe("queryAgent onAgentEvent", () => {
     const events: AgentStreamEvent[] = [];
     await drain(events);
     expect(events).toContainEqual({ kind: "tool_end", id: "t2", isError: true });
-    expect(events).toContainEqual({ kind: "result", isError: true });
+    expect(events).toContainEqual({ kind: "result", isError: true, subtype: "error_max_turns" });
   });
 });

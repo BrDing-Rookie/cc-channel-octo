@@ -61,6 +61,16 @@ export interface ProgressCardContext {
 
 interface CardEntry {
   ctx: ProgressCardContext;
+  /**
+   * Turn-level generation fence. `setCardContext` stamps a fresh, strictly
+   * increasing value per turn; every public entry point (event / finalize / stop)
+   * is keyed by a {@link CardHandle} carrying the generation it was issued for and
+   * no-ops when the live entry has moved on. This is what stops a turn whose
+   * dispatch timed out — but whose SDK stream keeps running in the background (see
+   * session-router.ts, "we do NOT cancel the in-flight turn") — from writing its
+   * late thinking/tool/text into, or prematurely terminating, the NEXT turn's card.
+   */
+  generation: number;
   messageId?: string;
   phase: CardProgressState["phase"];
   steps: CardStep[];
@@ -68,12 +78,33 @@ interface CardEntry {
   dirty: boolean;
   inFlight: boolean;
   skip: boolean;
+  /** Sticky user-abort / dispatch-timeout flag; freezes intake so the card settles as "stopped". */
+  stopped: boolean;
+  /** Subtype of a non-success SDK `result` (e.g. `error_max_turns`), surfaced on the error frame. */
+  terminalError?: string;
+  /**
+   * Set by finalizeCard: the pending flush is the recorded terminal frame, not a
+   * transient mid-frame. Routed through the same flush path so it honors the 429
+   * cooldown window (held + retried), and the entry is removed once it lands.
+   */
+  terminal?: { phase: CardProgressState["phase"]; errorText?: string };
   flushTimer?: ReturnType<typeof setTimeout>;
   /** In-flight flush promise; finalizeCard awaits it so the terminal frame lands last. */
   flushPromise?: Promise<void>;
   cooldownTimer?: ReturnType<typeof setTimeout>;
   /** Next positive CAS value for an edit. */
   nextCardSeq: number;
+}
+
+/**
+ * Opaque per-turn handle returned by {@link setCardContext}. The dispatcher passes
+ * it back to {@link handleAgentEvent} / {@link finalizeCard} / {@link markStopped};
+ * each call is a no-op unless the live entry for `sessionKey` is still this exact
+ * `generation`. See {@link CardEntry.generation}.
+ */
+export interface CardHandle {
+  readonly sessionKey: string;
+  readonly generation: number;
 }
 
 const FLUSH_DEBOUNCE_MS = 800;
@@ -88,6 +119,8 @@ const THINKING_TOOL = "__thinking__";
 
 /** cc bots are a single identity per config, so a plain module Map suffices. */
 const cards = new Map<string, CardEntry>();
+/** Strictly increasing turn-generation source (see {@link CardEntry.generation}). */
+let generationSeq = 0;
 /** Earliest time each backend may receive another progress frame, keyed by apiUrl. */
 const rateLimitedUntil = new Map<string, number>();
 
@@ -161,28 +194,47 @@ function isCurrentEntry(sessionKey: string, entry: CardEntry): boolean {
 }
 
 /**
- * Register the send context at dispatch start. Replaces any prior generation:
- * the old entry's pending timers are cancelled and it is marked skip so a late
- * flush cannot fire against the new turn.
+ * Resolve a {@link CardHandle} to its live entry, but ONLY when the entry still
+ * carries the handle's generation. A superseded turn (its generation replaced by a
+ * later {@link setCardContext}) resolves to `undefined`, so its late events and its
+ * own finalize become no-ops against the new turn's card.
  */
-export function setCardContext(sessionKey: string, ctx: ProgressCardContext): void {
-  if (!sessionKey) return;
+function entryFor(handle: CardHandle): CardEntry | undefined {
+  const entry = cards.get(handle.sessionKey);
+  if (!entry || entry.generation !== handle.generation) return undefined;
+  return entry;
+}
+
+/**
+ * Register the send context at dispatch start and return the turn's {@link CardHandle}.
+ * Replaces any prior generation: the old entry's pending timers are cancelled and it
+ * is marked skip so a late flush cannot fire against the new turn. The returned handle
+ * fences every later event/finalize/stop to THIS turn's generation.
+ */
+export function setCardContext(sessionKey: string, ctx: ProgressCardContext): CardHandle {
+  // Empty key → a handle whose generation (0) can never match a real entry, so all
+  // subsequent calls no-op. (generationSeq starts at 0; the first real turn is 1.)
+  if (!sessionKey) return { sessionKey, generation: 0 };
   const existing = cards.get(sessionKey);
   if (existing) {
     if (existing.flushTimer) clearTimeout(existing.flushTimer);
     clearCooldownTimer(existing);
     existing.skip = true;
   }
+  const generation = ++generationSeq;
   cards.set(sessionKey, {
     ctx,
+    generation,
     phase: "thinking",
     steps: [],
     startedAt: Date.now(),
     dirty: false,
     inFlight: false,
     skip: false,
+    stopped: false,
     nextCardSeq: 1,
   });
+  return { sessionKey, generation };
 }
 
 /** Hard cleanup (no terminal frame). Used for abnormal teardown. */
@@ -300,7 +352,13 @@ async function flush(sessionKey: string): Promise<void> {
 async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
   entry.dirty = false;
   const signal = AbortSignal.timeout(EDIT_TIMEOUT_MS);
-  const { card, plain } = renderProgressCard(progressState(entry), entry.ctx.caps);
+  // A terminal frame (set by finalizeCard) renders its settled phase and is
+  // RECORDED (enters the D10 revision history); mid-frames render the live phase
+  // and are transient. Routing both through here means the terminal frame obeys
+  // the same 429 cooldown as any other, instead of bypassing the window.
+  const terminal = entry.terminal;
+  const state = progressState(entry, terminal ? terminal.phase : entry.phase, terminal?.errorText);
+  const { card, plain } = renderProgressCard(state, entry.ctx.caps);
   try {
     if (!entry.messageId) {
       const res = await sendCardMessage({
@@ -317,6 +375,7 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
       if (!entry.messageId) {
         warn("placeholder card send returned no message_id; disabling for session");
         entry.skip = true;
+        return;
       }
     } else {
       await editCardMessage({
@@ -328,13 +387,29 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
         card,
         plain,
         cardSeq: entry.nextCardSeq++,
-        transient: true,
+        // Terminal frame is recorded; mid-frames are transient (kept out of history).
+        ...(terminal ? {} : { transient: true }),
         signal,
       });
     }
+    // Terminal frame landed → tear the entry down so a late duplicate can't fire.
+    if (terminal) finalizeCleanup(sessionKey, entry);
   } catch (err) {
-    handleFlushError(sessionKey, entry, err, "flush");
+    // On a 429 the terminal frame is re-held (dirty stays set) and retried when the
+    // window clears, NOT dropped — so a cooldown at finalize time cannot lose it.
+    handleFlushError(sessionKey, entry, err, terminal ? "finalize" : "flush");
   }
+}
+
+/** Terminal frame landed (or the session is being abandoned): cancel timers, drop the entry. */
+function finalizeCleanup(sessionKey: string, entry: CardEntry): void {
+  if (entry.flushTimer) {
+    clearTimeout(entry.flushTimer);
+    entry.flushTimer = undefined;
+  }
+  clearCooldownTimer(entry);
+  entry.terminal = undefined;
+  if (cards.get(sessionKey) === entry) cards.delete(sessionKey);
 }
 
 function handleFlushError(sessionKey: string, entry: CardEntry, err: unknown, where: string): void {
@@ -423,14 +498,30 @@ function onAnswering(sessionKey: string, entry: CardEntry): void {
 }
 
 /**
- * Feed one SDK stream event into the state machine. Safe to call for any session;
- * a no-op when no card context is registered or the entry is stale/skipped.
+ * A non-success SDK result (error_max_turns, error, …) drives the card's terminal
+ * to "error" rather than the default "done": {@link finalizeCard} reads this phase
+ * so a tool-failed turn is never mislabeled complete. The subtype is stashed for
+ * the error frame's text.
+ */
+function onResult(entry: CardEntry, ev: Extract<AgentStreamEvent, { kind: "result" }>): void {
+  if (!ev.isError || entry.phase === "stopped") return;
+  entry.phase = "error";
+  if (!entry.terminalError && ev.subtype) entry.terminalError = ev.subtype;
+  // Terminal frame is emitted by finalizeCard (called by the dispatcher immediately
+  // after the stream ends); no flush is scheduled here.
+}
+
+/**
+ * Feed one SDK stream event into the state machine. Fenced to the handle's turn
+ * generation: a no-op when the entry is stale/skipped (a superseding turn owns the
+ * card) or the turn has been marked stopped (intake is frozen so the card settles).
  * `text` steps also record startedAt at tool_start so tool_end can compute a
  * duration (the SDK gives no per-tool duration).
  */
-export function handleAgentEvent(sessionKey: string, event: AgentStreamEvent): void {
-  const entry = cards.get(sessionKey);
-  if (!entry || entry.skip) return;
+export function handleAgentEvent(handle: CardHandle, event: AgentStreamEvent): void {
+  const entry = entryFor(handle);
+  if (!entry || entry.skip || entry.stopped) return;
+  const sessionKey = handle.sessionKey;
   switch (event.kind) {
     case "thinking":
       onThinking(sessionKey, entry, event);
@@ -446,8 +537,7 @@ export function handleAgentEvent(sessionKey: string, event: AgentStreamEvent): v
       onAnswering(sessionKey, entry);
       break;
     case "result":
-      // The turn-level finalizeCard (called by the dispatcher) owns the terminal
-      // frame; nothing to do here beyond what tool_end/text already captured.
+      onResult(entry, event);
       break;
   }
 }
@@ -456,15 +546,23 @@ export function handleAgentEvent(sessionKey: string, event: AgentStreamEvent): v
 
 /**
  * Dispatch teardown: settle the card into its terminal frame. Idempotent and
- * fail-closed. A turn that never sent a card (pure text / pure thinking / debounce
- * never fired without real steps) leaves nothing behind.
+ * fail-closed. Fenced to the handle's turn generation — a superseded turn's
+ * finalize (e.g. from a handler still running after a dispatch timeout) no-ops
+ * against the new turn's card. A turn that never sent a card and did no visible
+ * tool work leaves nothing behind.
+ *
+ * The terminal frame goes through the SAME flush path (and thus the SAME 429
+ * cooldown) as mid-frames: if a cooldown is open it is held and flushed once the
+ * window clears (and retried, not dropped, on a further 429) rather than bypassing
+ * the window with an immediate append.
  */
 export async function finalizeCard(
-  sessionKey: string,
+  handle: CardHandle,
   opts: { success: boolean; errorText?: string } = { success: true },
 ): Promise<void> {
-  const entry = cards.get(sessionKey);
+  const entry = entryFor(handle);
   if (!entry) return;
+  const sessionKey = handle.sessionKey;
   // Let the in-flight flush land first so the terminal frame is strictly last.
   if (entry.flushPromise) {
     try { await entry.flushPromise; } catch { /* runFlush already warned */ }
@@ -473,63 +571,47 @@ export async function finalizeCard(
     clearTimeout(entry.flushTimer);
     entry.flushTimer = undefined;
   }
-  clearCooldownTimer(entry);
   endRunningThinking(entry, Date.now());
 
-  // Only settle the current generation; a superseding turn owns its own card.
-  if (cards.get(sessionKey) === entry) cards.delete(sessionKey);
-  if (entry.skip) return;
-
-  const terminalPhase: CardProgressState["phase"] = entry.phase === "stopped"
-    ? "stopped"
-    : opts.success && !opts.errorText ? "done" : "error";
-  const state = progressState(entry, terminalPhase, opts.errorText);
-
-  // Nothing sent yet: only emit a terminal card when the turn actually did tool
-  // work worth showing. Otherwise stay silent (the text answer stands alone).
-  if (!entry.messageId) {
-    if (!hasRealStep(entry)) return;
-    if (cooldownRemainingMs(entry.ctx.apiUrl) > 0) return;
-    const { card, plain } = renderProgressCard(state, entry.ctx.caps);
-    try {
-      await sendCardMessage({
-        apiUrl: entry.ctx.apiUrl,
-        botToken: entry.ctx.botToken,
-        channelId: entry.ctx.channelId,
-        channelType: entry.ctx.channelType,
-        card,
-        plain,
-        signal: AbortSignal.timeout(EDIT_TIMEOUT_MS),
-      });
-    } catch (err) {
-      warn(`terminal card send failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  // Disabled session (deterministic 4xx earlier): drop it, emit nothing.
+  if (entry.skip) {
+    if (cards.get(sessionKey) === entry) cards.delete(sessionKey);
     return;
   }
 
-  const { card, plain } = renderProgressCard(state, entry.ctx.caps);
-  try {
-    await editCardMessage({
-      apiUrl: entry.ctx.apiUrl,
-      botToken: entry.ctx.botToken,
-      messageId: entry.messageId,
-      channelId: entry.ctx.channelId,
-      channelType: entry.ctx.channelType,
-      card,
-      plain,
-      cardSeq: entry.nextCardSeq++,
-      // Terminal frame is recorded (NOT transient) so it enters the revision history.
-      signal: AbortSignal.timeout(EDIT_TIMEOUT_MS),
-    });
-  } catch (err) {
-    warn(`finalize edit failed: ${err instanceof Error ? err.message : String(err)}`);
+  const errored = entry.phase === "error" || !opts.success || !!opts.errorText;
+  const terminalPhase: CardProgressState["phase"] = entry.stopped || entry.phase === "stopped"
+    ? "stopped"
+    : errored ? "error" : "done";
+  const errorText = opts.errorText ?? (errored ? entry.terminalError : undefined);
+
+  // Nothing sent yet and no tool work worth showing: stay silent (the text answer
+  // stands alone). A pure-text / pure-thinking turn leaves no card.
+  if (!entry.messageId && !hasRealStep(entry)) {
+    if (cards.get(sessionKey) === entry) cards.delete(sessionKey);
+    return;
   }
+
+  entry.terminal = { phase: terminalPhase, ...(errorText ? { errorText } : {}) };
+  entry.dirty = true;
+  // flush() sends now when clear, or holds + arms a cooldown wake when rate-limited;
+  // runFlush records the frame (non-transient) and tears the entry down on success.
+  await flush(sessionKey);
 }
 
-/** Mark the turn as user-aborted so the terminal frame renders as "stopped". */
-export function markStopped(sessionKey: string): void {
-  const entry = cards.get(sessionKey);
-  if (!entry || entry.skip) return;
+/**
+ * Mark the turn as aborted (user stop / dispatch timeout) so the terminal frame
+ * renders as "stopped". Fenced to the handle's generation and STICKY: sets a flag
+ * that freezes further event intake, so a background stream that keeps producing
+ * after the timeout cannot flip the card back off "stopped".
+ */
+export function markStopped(handle: CardHandle): void {
+  const entry = entryFor(handle);
+  if (!entry || entry.skip || entry.stopped) return;
   endRunningThinking(entry, Date.now());
   entry.phase = "stopped";
+  entry.stopped = true;
+  // Reflect the stopped state promptly even if finalizeCard is delayed by a hung
+  // handler; only when a card already exists (nothing to send otherwise).
+  if (entry.messageId) scheduleFlush(handle.sessionKey, entry);
 }
