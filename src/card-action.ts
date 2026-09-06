@@ -101,15 +101,32 @@ export function formatCardActionText(action: CardAction): string {
 
 /** Translate a verified card action into the same message shape used by the normal inbound path. */
 export function synthesizeCardActionMessage(action: CardAction, botUid: string): BotMessage {
-  // card_action uses the peer uid as channel_id for DMs. Reconstruct an internal
-  // space-aware channel id so the normal inbound path derives the same Space session/queue.
-  const channelId = action.channelType === ChannelType.DM && action.spaceId
+  // card_action carries the DM peer as a BARE operator_uid: the server contract
+  // sets it to the authenticated login uid (octo-server
+  // modules/message/api_card_action.go — `"operator_uid": loginUID`, with
+  // `loginUID := c.GetLoginUID()`), and the on-wire DM channel_id is that same
+  // bare peer uid (card-protocol.md §7.1: "DM 取对端用户 UID (= operator_uid) …
+  // 存储行的 fake id 编码始终不上线"). The space-aware compound id never rides the wire.
+  //
+  // The normal inbound DM path, however, carries from_uid in the compound form
+  // `s{spaceId}_{peerId}` and derives the session key from from_uid
+  // (session-router.ts sessionKey → `${spaceId}:${from_uid}`, spaceId parsed off
+  // from_uid in extractSpaceId). Reconstructing only channel_id left from_uid
+  // bare, so a DM card click keyed to `${spaceId}:{peer}` instead of
+  // `${spaceId}:s{spaceId}_{peer}` and ran in a DETACHED session — not resuming
+  // the user's live DM SDK session/history. Normalize BOTH from_uid and
+  // channel_id to the compound form for DMs so the re-run lands on the same
+  // session the user is already talking in. (Groups are keyed by channel_id and
+  // need no rewrite.)
+  const dmCompoundPeer = action.channelType === ChannelType.DM && action.spaceId
     ? `s${action.spaceId}_${action.operatorUid}`
-    : action.channelId;
+    : null;
+  const fromUid = dmCompoundPeer ?? action.operatorUid;
+  const channelId = dmCompoundPeer ?? action.channelId;
   return {
     message_id: `card_action:${action.eventId}`,
     message_seq: 0,
-    from_uid: action.operatorUid,
+    from_uid: fromUid,
     channel_id: channelId,
     channel_type: action.channelType,
     timestamp: action.actedAt ?? Math.floor(Date.now() / 1000),
