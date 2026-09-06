@@ -12,6 +12,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { handleForkCommand, type ForkCommandDeps } from '../commands.js';
 import { SessionStore } from '../session-store.js';
 import { createAdapter, type DbAdapter } from '../db-adapter.js';
+import { deriveForkCwdCtx, resolveSessionCwd, type SessionCtx } from '../cwd-resolver.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const PARENT_KEY = 'g100'; // a plain group channel_id
 const OWNER = 'owner-uid';
@@ -173,3 +177,56 @@ describe('SessionStore fork-parent anchor', () => {
     expect(store.getForkParent('g1____child')).toBe('g1');
   });
 });
+
+/**
+ * Regression for the #16 blocker: index.ts must resolve the SDK-query cwd (the
+ * bucket `resume` reads) via getForkParent → deriveForkCwdCtx, so a forked child
+ * lands in its PARENT's bucket — not its own. The earlier bug anchored the media/
+ * secret sandboxes but passed the child's own ctx to queryAgent, silently missing
+ * the fork on the first turn. This exercises the exact selection path index.ts
+ * uses at the queryAgent call site.
+ */
+describe('forked child SDK-query cwd resolves to the parent bucket', () => {
+  let adapter: DbAdapter;
+  let store: SessionStore;
+  let base: string;
+
+  beforeEach(() => {
+    adapter = createAdapter(':memory:');
+    store = new SessionStore(adapter);
+    store.init();
+    base = mkdtempSync(join(tmpdir(), 'fork-cwd-'));
+  });
+  afterEach(() => {
+    store.close();
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it('a session with setForkParent resolves its query cwd to the parent, not its own bucket', () => {
+    const PARENT = 'g100';
+    const CHILD = 'g100____T42';
+    store.setForkParent(CHILD, PARENT);
+
+    // What index.ts does at the queryAgent call site: ctx = own child ctx, then
+    // fork-anchored via getForkParent.
+    const childOwnCtx: SessionCtx = { kind: 'group', sessionKey: CHILD };
+    const queryCtx = deriveForkCwdCtx(childOwnCtx, store.getForkParent(CHILD));
+
+    const parentCwd = resolveSessionCwd(base, { kind: 'group', sessionKey: PARENT });
+    const childOwnCwd = resolveSessionCwd(base, childOwnCtx);
+    const queryCwd = resolveSessionCwd(base, queryCtx);
+
+    // The forked child's SDK-query cwd MUST be the parent's bucket (where the
+    // forked transcript lives), and MUST NOT be the child's own naive bucket.
+    expect(queryCwd).toBe(parentCwd);
+    expect(queryCwd).not.toBe(childOwnCwd);
+  });
+
+  it('a non-forked session resolves to its own bucket (unchanged behavior)', () => {
+    const KEY = 'g200';
+    const ownCtx: SessionCtx = { kind: 'group', sessionKey: KEY };
+    const queryCtx = deriveForkCwdCtx(ownCtx, store.getForkParent(KEY)); // undefined anchor
+    expect(resolveSessionCwd(base, queryCtx)).toBe(resolveSessionCwd(base, ownCtx));
+  });
+});
+

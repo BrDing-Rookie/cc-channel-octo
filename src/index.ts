@@ -31,7 +31,7 @@ import type { CardHandle } from './card-progress.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import { sanitizeDisplayName, escapeSectionMarkers, sanitizePromptBody, formatSenderLabel } from './prompt-safety.js';
 import type { SessionCtx } from './cwd-resolver.js';
-import { cleanupExpiredCwds, resolveMemoryDir, resolveSessionCwd } from './cwd-resolver.js';
+import { cleanupExpiredCwds, deriveForkCwdCtx, resolveMemoryDir, resolveSessionCwd } from './cwd-resolver.js';
 import { StreamRelay } from './stream-relay.js';
 import { sendMessage, sendReadReceipt, getChannelMessages, getUploadCredentials, createThread } from './octo/api.js';
 import type { HistoricalMessage } from './octo/api.js';
@@ -680,9 +680,7 @@ export async function handleMessage(
       // parent; history, memory, group-context, and routing keep the child's own
       // key. A normal (non-forked) session resolves to itself.
       const forkParentKey = store.getForkParent(sessionKey);
-      const cwdCtx: SessionCtx = forkParentKey
-        ? { kind: 'group', sessionKey: forkParentKey }
-        : sessionCtx;
+      const cwdCtx: SessionCtx = deriveForkCwdCtx(sessionCtx, forkParentKey);
 
       // --- v0.3: in-chat slash commands (/reset, /config, /help) ---
       // Handled before group-context caching, history append, and the agent
@@ -1429,7 +1427,13 @@ export async function handleMessage(
         }
       }
 
-      const rawChunks = queryAgent(userContentForLLM, config, sessionCtx, onToolUse, sessionOpts);
+      // G1: pass cwdCtx (NOT sessionCtx) — this is the call that drives the SDK
+      // query cwd, hence which project bucket `resume` reads. A /fork child must
+      // resolve to the PARENT's bucket (where forkSession wrote the transcript);
+      // using the child's own ctx here would silently miss the fork on the first
+      // turn. Memory stays child-scoped via opts.memoryDir; onSessionId still
+      // persists to the child key. For a non-forked session cwdCtx === sessionCtx.
+      const rawChunks = queryAgent(userContentForLLM, config, cwdCtx, onToolUse, sessionOpts);
 
       // Tee the generator: collect full text while streaming to Octo
       const collected: string[] = [];
