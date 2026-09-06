@@ -159,6 +159,35 @@ export interface Config {
    * is true.
    */
   threadMdEventTypes?: string[];
+  /**
+   * F1 feature flag: when true, the group mention gate consults the
+   * server-authoritative two-axis mention preference (`GET
+   * /v1/bot/groups/{groupNo}/mention_pref`, cached in-memory) and relaxes the
+   * @-mention requirement for a group iff `pref.effective` is true — but ONLY for
+   * human senders (a bot / OBO sender is never relaxed). Off (default) → only the
+   * legacy static `mentionFreeGroups` list is honored, exactly as before. The
+   * static list remains a local operator override (force-on) regardless of this
+   * flag; the server pref is the authoritative replacement for it.
+   */
+  serverMentionPref?: boolean;
+  /**
+   * F1: TTL in ms for the in-memory mention-pref cache — a cached pref is
+   * re-fetched once it is this old, so an owner's server-side toggle eventually
+   * takes effect even before the `mention_pref_updated` event lands. Defaults to
+   * `DEFAULT_MENTION_PREF_TTL_MS` (60 s). Only meaningful when `serverMentionPref`
+   * is true.
+   */
+  mentionPrefTtlMs?: number;
+  /**
+   * F1: `event.type` literal(s) the server emits when a group's mention pref
+   * changes. On such an event the in-memory mention-pref cache for that group is
+   * invalidated so the next turn re-fetches (never trusting the event payload —
+   * see group-md-events.ts). PROVISIONAL: the exact literal is not yet confirmed
+   * from a captured event, so it is overridable here to calibrate without a code
+   * change. Defaults to `DEFAULT_MENTION_PREF_EVENT_TYPES`. Only meaningful when
+   * `serverMentionPref` is true.
+   */
+  mentionPrefEventTypes?: string[];
   sdk: {
     model?: string;
     /**
@@ -450,6 +479,9 @@ type PartialConfig = {
   mdWriteback?: boolean;
   threadMd?: boolean;
   threadMdEventTypes?: string[];
+  serverMentionPref?: boolean;
+  mentionPrefTtlMs?: number;
+  mentionPrefEventTypes?: string[];
   sdk?: Partial<Config['sdk']>;
   rateLimit?: Partial<Config['rateLimit']>;
   context?: Partial<Config['context']>;
@@ -548,6 +580,9 @@ function mergeConfig(base: Config, override: PartialConfig): Config {
     mdWriteback: override.mdWriteback ?? base.mdWriteback,
     threadMd: override.threadMd ?? base.threadMd,
     threadMdEventTypes: override.threadMdEventTypes ?? base.threadMdEventTypes,
+    serverMentionPref: override.serverMentionPref ?? base.serverMentionPref,
+    mentionPrefTtlMs: override.mentionPrefTtlMs ?? base.mentionPrefTtlMs,
+    mentionPrefEventTypes: override.mentionPrefEventTypes ?? base.mentionPrefEventTypes,
     sdk: {
       ...base.sdk,
       ...(override.sdk ?? {}),
@@ -797,6 +832,9 @@ export function resolveBotConfigs(config: Config): Config[] {
       mdWriteback: perBotFile.mdWriteback ?? config.mdWriteback,
       threadMd: perBotFile.threadMd ?? config.threadMd,
       threadMdEventTypes: perBotFile.threadMdEventTypes ?? config.threadMdEventTypes,
+      serverMentionPref: perBotFile.serverMentionPref ?? config.serverMentionPref,
+      mentionPrefTtlMs: perBotFile.mentionPrefTtlMs ?? config.mentionPrefTtlMs,
+      mentionPrefEventTypes: perBotFile.mentionPrefEventTypes ?? config.mentionPrefEventTypes,
       sdk: {
         ...config.sdk,
         ...(perBotFile.sdk ?? {}),

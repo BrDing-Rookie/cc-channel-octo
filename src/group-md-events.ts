@@ -97,3 +97,41 @@ export function isThreadMdUpdateEvent(
   if (!event || typeof event.type !== 'string' || event.type === '') return false;
   return eventTypes.includes(event.type);
 }
+
+/**
+ * Provisional `event.type` literal(s) the server emits when a group's mention
+ * preference changes (F1). On such an event the in-memory MentionPrefCache entry
+ * for that group is invalidated so the next turn re-fetches the authoritative
+ * two-axis pref (never trusting the event body — identical anti-poisoning
+ * rationale to the md events above: the worst a forged `mention_pref_updated` can
+ * do is force a redundant authenticated re-fetch of the real pref). PROVISIONAL:
+ * the exact wire literal is not yet confirmed from a captured event, so it is
+ * named after the design and overridable via `config.mentionPrefEventTypes`
+ * without a code change.
+ *
+ * DISJOINT from the `group_md_*` / `thread_md_*` literal sets, so a mention-pref
+ * event never trips an md invalidation and vice versa.
+ */
+export const DEFAULT_MENTION_PREF_EVENT_TYPES: readonly string[] = [
+  'mention_pref_updated',
+];
+
+/** The `payload.event` shape for a mention-pref change (mirrors {@link GroupMdEventLike}). */
+export interface MentionPrefEventLike {
+  type?: string;
+  group_no?: string;
+}
+
+/**
+ * True iff this event signals a mention-preference change and should drive a
+ * cache invalidation. All other system events return false and are dropped
+ * unchanged by the router. `eventTypes` lets the operator override the
+ * provisional literal without a code change.
+ */
+export function isMentionPrefUpdateEvent(
+  event: MentionPrefEventLike | undefined,
+  eventTypes: readonly string[] = DEFAULT_MENTION_PREF_EVENT_TYPES,
+): boolean {
+  if (!event || typeof event.type !== 'string' || event.type === '') return false;
+  return eventTypes.includes(event.type);
+}

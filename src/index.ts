@@ -41,6 +41,7 @@ import { downloadInboundImage, MAX_IMAGES_PER_MESSAGE } from './media-inbound.js
 import { handleCommand } from './commands.js';
 import { resolveGroupInstructions } from './group-md.js';
 import { GroupMdCache, ThreadMdCache, DEFAULT_GROUP_MD_TTL_MS } from './group-md-cache.js';
+import { MentionPrefCache, DEFAULT_MENTION_PREF_TTL_MS } from './mention-pref-cache.js';
 import { GroupMdWriteback, ThreadMdWriteback } from './group-md-writeback.js';
 import { CronStore } from './cron-store.js';
 import { CronScheduler } from './cron-scheduler.js';
@@ -294,6 +295,12 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
     // can never read or write a parent-group GROUP.md entry (老板拍板互斥口径). ---
     const threadMdCache = new ThreadMdCache(config.serverMdTtlMs ?? DEFAULT_GROUP_MD_TTL_MS);
 
+    // --- F1: server mention-pref cache. Same IN-MEMORY-ONLY model as the md
+    // caches (a stale/forged value can only widen or narrow the @-mention gate for
+    // humans, never inject prompt content, so it is even lower-risk). Created
+    // unconditionally (cheap; only populated when config.serverMentionPref is on). ---
+    const mentionPrefCache = new MentionPrefCache(config.mentionPrefTtlMs ?? DEFAULT_MENTION_PREF_TTL_MS);
+
     // --- P2-C: GROUP.md write-back coordinator. Shared across turns so its
     // per-groupNo write lock actually serializes concurrent agent turns writing
     // the same group (a per-turn instance would defeat the lock). Updates the
@@ -366,7 +373,19 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
     // THREAD.md change event invalidates the affected entry (re-fetched
     // authoritatively next turn — never trusting the event payload). No-op when
     // the corresponding flag (serverMd / threadMd) is off.
-    const router = new SessionRouter(config, gateway.botId, gateway.ownerUid, groupMdCache, threadMdCache);
+    const router = new SessionRouter(
+      config,
+      gateway.botId,
+      gateway.ownerUid,
+      groupMdCache,
+      threadMdCache,
+      mentionPrefCache,
+      // F1: server-authoritative robot-flag lookup so the mention gate can relax
+      // the @-mention requirement only for human senders. GroupContext.isRobot
+      // returns undefined until the roster is warmed; the router fails closed
+      // against bots in that case.
+      (channelId: string, uid: string) => groupContext.isRobot(channelId, uid),
+    );
 
     // --- Active handler tracking (Q6: in-flight drain on shutdown) ---
     const activeHandlers = new Set<Promise<void>>();
