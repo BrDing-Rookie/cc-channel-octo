@@ -210,6 +210,25 @@ export class SessionRouter {
       return;
     }
 
+    // Severe fix 2b: a genuine doc task must bind its claim-release / event-ack /
+    // fallback-notice lifecycle to the REAL turn settle, never to the dispatch
+    // timeout. The doc-mention handler treats "dispatch resolved" as "the turn
+    // (incl. the final doc POST) is done" — its documented contract. If the
+    // timeout let dispatch resolve while the turn kept running in the background,
+    // the handler would see an EMPTY report and prematurely release the dedupe
+    // claim, ack the event, and post a "no reply" fallback — after which the
+    // still-running turn completes its non-idempotent document edit, and any
+    // redelivery (dedupe now released) could run a SECOND concurrent edit. So for
+    // a doc task we await the handler to true completion. The session-lock
+    // early-release the timeout buys is a no-op here anyway: the event poller
+    // processes doc mentions strictly serially, so nothing else is waiting on this
+    // lock. index.ts's handler is fully self-contained (never throws for a doc
+    // task), matching the timeout-disabled branch above.
+    if (isAuthenticDocFire(result.message.payload)) {
+      await handler(result);
+      return;
+    }
+
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const timeoutError = new Error(`dispatch timed out after ${timeoutMs}ms`);
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -729,6 +748,14 @@ export class SessionRouter {
   }
 
   private async replySafe(msg: BotMessage, content: string): Promise<void> {
+    // Egress-purity gate (severe fix 2a): a genuine doc task must NEVER touch the
+    // IM sendMessage path. Its channel id is a non-routable sentinel, so the wire
+    // call would fail anyway, but the invariant is constructive — "a doc task never
+    // reaches IM egress" — not "it happens to fail". Rate-limit / oversized /
+    // dispatch-timeout notices for a doc fire are dropped here (the doc-mention
+    // handler owns the doc-side fallback notice on the comment thread), so no
+    // apology is ever synthesized onto the IM path for a doc task.
+    if (isAuthenticDocFire(msg.payload)) return;
     if (!msg.channel_id || msg.channel_type === undefined) return;
     try {
       await sendMessage({

@@ -12,6 +12,12 @@ import type { Config } from '../config.js';
 import { sendMessage } from '../octo/api.js';
 import { GroupMdCache, ThreadMdCache } from '../group-md-cache.js';
 import type { GroupMdEntry } from '../group-md-cache.js';
+import {
+  parseDocCommentMention,
+  docTaskSessionScope,
+  synthesizeDocMentionMessage,
+  type DocTaskContext,
+} from '../doc-mention.js';
 
 const ROBOT_ID = 'bot-001';
 
@@ -611,6 +617,97 @@ describe('dispatch timeout (#141)', () => {
     expect(completed).toEqual([2]);
     // A non-timeout error must NOT trigger the timeout apology.
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Doc-task egress purity + claim lifecycle (severe fixes 2a / 2b) ─────────
+
+describe('doc-task dispatch (2a egress purity + 2b claim lifecycle)', () => {
+  const DOC_BOT = 'bot_1';
+  const docMention = parseDocCommentMention({
+    event_id: 5,
+    event_type: 'doc_comment_mention',
+    event_data: {
+      idempotency_key: 'idem-1', doc_id: 'doc_1', comment_id: 'c1', thread_id: '70',
+      from_uid: 'u_author', bot_uid: DOC_BOT, text: 'fix it',
+    },
+  })!;
+  const docCtx: DocTaskContext = {
+    docId: docMention.docId, threadId: docMention.threadId, commentId: docMention.commentId,
+    sessionScope: docTaskSessionScope(docMention), postComment: async () => {}, reportTurn: () => {},
+  };
+  const docFire = (): BotMessage => synthesizeDocMentionMessage(docMention, DOC_BOT, docCtx);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('2a: a rate-limited doc fire never touches the IM send path', async () => {
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 1 } }),
+      DOC_BOT,
+    );
+    // First fire consumes the single token; the second trips the per-user bucket.
+    await router.route(docFire());
+    const blocked = await router.route(docFire());
+
+    expect(blocked?.rejectionReason).toBe('rate_limited');
+    // 2a: replySafe must NOT synthesize a '请稍后再试' onto IM for a doc task.
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('2a: a dispatch timeout produces no IM apology for a doc fire', async () => {
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 20 }),
+      DOC_BOT,
+    );
+    let handlerSettled = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+
+    const p = router.routeAndHandle(docFire(), async () => {
+      await gate; // a real turn that outlives the dispatch timeout
+      handlerSettled = true;
+    });
+
+    // Wait well past the 20ms dispatch timeout.
+    await new Promise((r) => setTimeout(r, 60));
+
+    // 2b: a doc task is bound to the REAL turn settle — dispatch must NOT resolve
+    // early on timeout while the turn is still running in the background.
+    let resolvedEarly = false;
+    void p.then(() => { resolvedEarly = true; });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(resolvedEarly).toBe(false);
+    expect(handlerSettled).toBe(false);
+    // 2a: no IM apology despite the elapsed timeout.
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // Let the turn settle → only now does dispatch resolve (bound to true completion).
+    release();
+    await p;
+    expect(handlerSettled).toBe(true);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('2b: a normal (non-doc) hung turn still times out and releases the lock', async () => {
+    // Control: the timeout binding is doc-task-specific; ordinary turns keep the
+    // #141 behavior (release the lock, apologize) so one hung turn can't wedge a
+    // session forever.
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 20 }),
+      DOC_BOT,
+    );
+    await router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      () => new Promise<void>(() => { /* never resolves */ }),
+    );
+    // A normal message DOES get the bounded apology (proving the doc-only guard
+    // above didn't disable the timeout globally).
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sendMessage).mock.calls[0][0]).toMatchObject({
+      content: expect.stringContaining('处理超时'),
+    });
   });
 });
 

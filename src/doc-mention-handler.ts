@@ -43,7 +43,12 @@ export interface DocMentionHandlerDeps {
   botUid: string;
   apiUrl: string;
   botToken: string;
-  /** Resolved docs service root (config.docsApiUrl ?? apiUrl) for the whole-doc URL. */
+  /**
+   * Resolved docs service root (config.docsApiUrl ?? apiUrl). Used both for the
+   * whole-doc URL handed to the agent AND as the base for the outbound comment
+   * reply POST (severe fix 1) — on a split deployment the docs service is a
+   * different host than the IM apiUrl, so the reply must go here, not to apiUrl.
+   */
   docsBaseUrl?: string;
   dedupe: DocMentionDedupeStore;
   dispatch: DocMentionDispatch;
@@ -95,7 +100,13 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
         }
         try {
           await postDocReply({
-            apiUrl: deps.apiUrl,
+            // The comment reply is a DOCS-backend egress: on a split deployment
+            // the docs service (config.docsApiUrl) is a different host than the IM
+            // apiUrl. Post to the resolved docs root so the reply actually reaches
+            // the document comment thread instead of being misrouted to the IM
+            // host (severe fix 1). `docsBaseUrl` is config.docsApiUrl ?? apiUrl, so
+            // a single-host deployment (docsBaseUrl absent) still falls back safely.
+            apiUrl: deps.docsBaseUrl ?? deps.apiUrl,
             botToken: deps.botToken,
             target: { docKind: mention.docKind, docId: mention.docId, parentId },
             body: text,
