@@ -1300,18 +1300,35 @@ function supportsTerminalCollapse(caps: CardCaps | undefined): boolean {
   );
 }
 
-function progressSummary(steps: CardStep[], total: number): string {
+/**
+ * 进度摘要的结构化拆分:每类活动一个 `{label, count}`。文本行与富样式行都从这一份派生,
+ * 保证「plain 与 rich 的 KPI 数字一定一致」—— 数据只算一次。
+ */
+interface ProgressStat {
+  label: string;
+  count: string;
+}
+
+function progressStats(steps: CardStep[], total: number): ProgressStat[] {
   const thinking = steps.filter((s) => s.tool === "__thinking__").length;
   const waiting = steps.filter((s) => s.tool === SUBAGENT_WAIT_STEP_TOOL).length;
   const tools = total - thinking - waiting;
-  const parts: string[] = [];
-  if (thinking > 0) parts.push(`Reasoning ${thinking}`);
-  if (tools > 0) parts.push(`Tools ${tools}`);
-  if (waiting > 0) parts.push(`Waiting ${waiting}`);
+  const parts: ProgressStat[] = [];
+  if (thinking > 0) parts.push({ label: "Reasoning", count: String(thinking) });
+  if (tools > 0) parts.push({ label: "Tools", count: String(tools) });
+  if (waiting > 0) parts.push({ label: "Waiting", count: String(waiting) });
   // 今天 total === steps.length,三类必占其一;兜底是防 total 日后改成「累计步数」而 steps
   // 只保留窗口时,摘要行静默变空串。
-  if (parts.length === 0) parts.push(`${total} ${total === 1 ? "step" : "steps"}`);
-  return parts.join(" · ");
+  if (parts.length === 0) parts.push({ label: total === 1 ? "step" : "steps", count: String(total) });
+  return parts;
+}
+
+function progressSummary(steps: CardStep[], total: number): string {
+  // 兜底那一条是「N steps」(数字在前),其余是「Reasoning N」(标签在前)。用 label 是否为
+  // step(s) 判断词序,保持与旧输出逐字一致。
+  return progressStats(steps, total)
+    .map((s) => (s.label === "step" || s.label === "steps" ? `${s.count} ${s.label}` : `${s.label} ${s.count}`))
+    .join(" · ");
 }
 
 function terminalHeaderSegments(state: CardProgressState): RichSegment[] | null {
@@ -1334,8 +1351,27 @@ function terminalHeaderSegments(state: CardProgressState): RichSegment[] | null 
   return null;
 }
 
+/**
+ * KPI 摘要行的富样式版本(dataviz stat-strip):每个计数用 `accent` + 加粗让**数字**跳出来,
+ * 标签保持 subtle 作陪衬,分隔点 subtle。段拼接后与 `progressSummary` 逐字一致 —— plain 兜底
+ * 不变,降级到纯 TextBlock 时也读同一句话。`accent` 是 octo/v1 白名单里的语义色,明暗主题下
+ * 都是可访问的强调色(不像 good/warning 带状态语义,计数是中性指标,accent 才对)。
+ */
 function progressSummarySegments(steps: CardStep[], total: number): RichSegment[] {
-  return [{ text: progressSummary(steps, total), subtle: true }];
+  const stats = progressStats(steps, total);
+  const segs: RichSegment[] = [];
+  stats.forEach((stat, i) => {
+    if (i > 0) segs.push({ text: " · ", subtle: true });
+    const numberFirst = stat.label === "step" || stat.label === "steps";
+    if (numberFirst) {
+      segs.push({ text: stat.count, bold: true, color: "accent" });
+      segs.push({ text: ` ${stat.label}`, subtle: true });
+    } else {
+      segs.push({ text: `${stat.label} `, subtle: true });
+      segs.push({ text: stat.count, bold: true, color: "accent" });
+    }
+  });
+  return segs;
 }
 
 function richTextBlock(segments: RichSegment[]): Record<string, unknown> {

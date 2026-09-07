@@ -329,13 +329,22 @@ function nextId(ctx: RenderCtx, prefix: string): string {
   return `octo_disp_${prefix}_${ctx.uid.n++}`;
 }
 
-function textBlock(text: string, opts?: { bold?: boolean; size?: "medium" | "large" }): Record<string, unknown> {
+/**
+ * TextBlock 工厂。视觉旋钮只用 octo/v1 端到端验证过的那几个:`weight`(层级)、`size`
+ * (层级)、`spacing`(留白节奏)、`wrap`(永远 true,IM 窄屏不横向截断)。不引入未验证属性
+ * (如 `separator`),规避服务端 400。
+ */
+function textBlock(
+  text: string,
+  opts?: { bold?: boolean; size?: "medium" | "large"; spacing?: "Small" | "Medium" | "Large" },
+): Record<string, unknown> {
   return {
     type: "TextBlock",
     text,
     wrap: true,
     ...(opts?.bold ? { weight: "Bolder" } : {}),
     ...(opts?.size ? { size: opts.size === "medium" ? "Medium" : "Large" } : {}),
+    ...(opts?.spacing ? { spacing: opts.spacing } : {}),
   };
 }
 
@@ -350,7 +359,13 @@ function openUrlAction(title: string, url: string): Record<string, unknown> {
 function renderHeading(text: string, size: "medium" | "large" | undefined, ctx: RenderCtx): Rendered {
   const clean = sanitize(text, ctx);
   if (!clean) return EMPTY;
-  return { elements: [textBlock(clean, { bold: true, size })], plainLines: [clean] };
+  // 设计意图 → AC 属性:heading 是**区段锚点**,靠 (a) size 建立层级(缺省 Medium,`large`
+  // 升到 Large),(b) spacing="Medium" 在它与上一块之间留白,让每个区段有呼吸感。默认正文
+  // 不带 size,所以 heading 一定视觉上高于正文 —— 层级不再只靠加粗这一个信号。
+  return {
+    elements: [textBlock(clean, { bold: true, size: size ?? "medium", spacing: "Medium" })],
+    plainLines: [clean],
+  };
 }
 
 function renderText(text: string, ctx: RenderCtx): Rendered {
@@ -577,6 +592,12 @@ function renderGroup(
         {
           type: "Container",
           ...(style && style !== "default" ? { style } : {}),
+          // 设计意图 → AC 属性:分组要与相邻内容拉开留白,否则一段着色 callout 紧贴正文会读成
+          // 背景噪声而非强调。着色容器(good/warning/attention/emphasis)是**语义强调**,给
+          // Medium;中性分组只是逻辑归类,给 Small —— 强调块因此天然比普通分组更"跳"。
+          // 在进度卡时间线里这条规则顺带把 running/error 阶段(warning/attention)与已结算的
+          // default 阶段区分开:出问题/在跑的阶段留白更大,视线自然落到它上面。
+          spacing: style && style !== "default" ? "Medium" : "Small",
           items: inner.elements,
         },
       ],
@@ -873,7 +894,12 @@ export function buildDisplayCard(opts: BuildDisplayCardOptions): BuildDisplayCar
   if (title) {
     cleanTitle = sanitize(title, ctx) ?? "";
     if (cleanTitle) {
-      groups.push({ elements: [textBlock(cleanTitle, { bold: true })], plainLines: [cleanTitle] });
+      // 标题是整卡的报头(masthead):Bolder + Large,视觉上高于任何区段 heading(Medium),
+      // 建立「卡名 > 区段 > 正文」三级层级。不加 spacing —— 它已在卡首,上方没有内容要隔开。
+      groups.push({
+        elements: [textBlock(cleanTitle, { bold: true, size: "large" })],
+        plainLines: [cleanTitle],
+      });
     }
   }
 

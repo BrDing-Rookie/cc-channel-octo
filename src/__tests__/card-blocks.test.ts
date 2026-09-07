@@ -44,10 +44,11 @@ describe("buildDisplayCard 骨架", () => {
     expect(Array.isArray(card.body)).toBe(true);
   });
 
-  it("title 渲染成置顶 Bolder TextBlock,plain 首行是 title", () => {
+  it("title 渲染成置顶 Bolder Large TextBlock(整卡报头),plain 首行是 title", () => {
     const { card, plain } = buildDisplayCard({ title: "审批请求", blocks: [] });
     const els = body({ card });
-    expect(els[0]).toEqual({ type: "TextBlock", text: "审批请求", wrap: true, weight: "Bolder" });
+    // 标题是整卡报头:Bolder + Large,视觉上高于任何区段 heading(Medium)与正文。
+    expect(els[0]).toEqual({ type: "TextBlock", text: "审批请求", wrap: true, weight: "Bolder", size: "Large" });
     expect(plain.split("\n")[0]).toBe("审批请求");
   });
 
@@ -64,9 +65,15 @@ describe("buildDisplayCard 骨架", () => {
 });
 
 describe("heading / text block", () => {
-  it("heading → Bolder TextBlock", () => {
+  it("heading → Bolder Medium TextBlock(区段锚点,带上方留白)", () => {
     const { card } = buildDisplayCard({ blocks: [{ type: "heading", text: "标题" }] });
-    expect(body({ card })[0]).toEqual({ type: "TextBlock", text: "标题", wrap: true, weight: "Bolder" });
+    // 缺省 heading 升到 Medium(高于正文默认字号)并带 spacing=Medium,与上一块拉开区段留白。
+    expect(body({ card })[0]).toEqual({ type: "TextBlock", text: "标题", wrap: true, weight: "Bolder", size: "Medium", spacing: "Medium" });
+  });
+
+  it("heading size=large → Bolder Large TextBlock(仍带上方留白)", () => {
+    const { card } = buildDisplayCard({ blocks: [{ type: "heading", text: "大标题", size: "large" }] });
+    expect(body({ card })[0]).toEqual({ type: "TextBlock", text: "大标题", wrap: true, weight: "Bolder", size: "Large", spacing: "Medium" });
   });
 
   it("text → 普通 TextBlock(wrap)", () => {
@@ -525,6 +532,33 @@ describe("group block(分组着色)", () => {
     expect(els).toHaveLength(2); // 平铺,无 Container 外壳
     expect((els[0] as { text: string }).text).toBe("a");
     expect((els[1] as { text: string }).text).toBe("b");
+  });
+
+  it("着色 group 给 Medium 留白、中性 group 给 Small —— 强调块视觉上更跳", () => {
+    const styled = buildDisplayCard({
+      caps: FULL_CAPS,
+      blocks: [{ type: "group", style: "warning", blocks: [{ type: "text", text: "待处理" }] }],
+    });
+    const neutral = buildDisplayCard({
+      caps: FULL_CAPS,
+      blocks: [{ type: "group", blocks: [{ type: "text", text: "分组" }] }],
+    });
+    expect((body(styled)[0] as { spacing: string }).spacing).toBe("Medium");
+    expect((body(neutral)[0] as { type: string; spacing: string; style?: string }))
+      .toMatchObject({ type: "Container", spacing: "Small" });
+    // 中性分组不着色。
+    expect((body(neutral)[0] as { style?: string }).style).toBeUndefined();
+  });
+
+  it("降级平铺时着色 group 的 spacing 一并丢弃,不残留在裸 TextBlock 上", () => {
+    // spacing 是 Container 的视觉属性;降级为平铺 TextBlock 时,子块本身不带我们注入的 spacing。
+    const { card } = buildDisplayCard({
+      caps: { elements: new Set(["TextBlock"]) },
+      blocks: [{ type: "group", style: "attention", blocks: [{ type: "text", text: "x" }] }],
+    });
+    const els = body({ card });
+    expect(els).toHaveLength(1);
+    expect(els[0]).toEqual({ type: "TextBlock", text: "x", wrap: true });
   });
 });
 

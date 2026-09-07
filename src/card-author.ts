@@ -173,7 +173,10 @@ export function buildInteractiveCard(
   }
 
   const body: Record<string, unknown>[] = [
-    { type: "TextBlock", text: title, weight: "Bolder", size: "Medium", wrap: true },
+    // 报头(masthead):Bolder + Large,与展示卡/进度卡的标题层级一致 —— 卡名永远是卡上最大的
+    // 那一行。交互卡多用于「审批 / 确认 / 短表单」,一个明确的问题标题决定用户能否一眼看懂要做
+    // 什么决定。
+    { type: "TextBlock", text: title, weight: "Bolder", size: "Large", wrap: true },
   ];
   const plainLines = [title];
   const text = spec.text ? cleanText(spec.text, MAX_TEXT) : null;
@@ -210,7 +213,8 @@ export function buildInteractiveCard(
       }
       const items: Record<string, unknown>[] = [];
       if (sectionTitle) {
-        items.push({ type: "TextBlock", text: sectionTitle, weight: "Bolder", wrap: true });
+        // 区段标题 Medium,落在报头 Large 与正文默认字号之间 —— 与展示卡 heading 的层级同构。
+        items.push({ type: "TextBlock", text: sectionTitle, weight: "Bolder", size: "Medium", wrap: true });
         plainLines.push(sectionTitle);
       }
       if (sectionText) {
