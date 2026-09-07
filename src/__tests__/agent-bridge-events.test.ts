@@ -83,3 +83,45 @@ describe("queryAgent onAgentEvent", () => {
     expect(events).toContainEqual({ kind: "result", isError: true, subtype: "error_max_turns" });
   });
 });
+
+describe("queryAgent onActivity (#141 liveness heartbeat)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("fires once per drained SDK message — including message types that emit no AgentStreamEvent", async () => {
+    // A bare `system` message and a session-id-only message produce no
+    // onAgentEvent, but must still count as a "still running" heartbeat so a turn
+    // whose only traffic is such messages is not misjudged as idle.
+    mockQuery.mockReturnValue(createMockStream([
+      { type: "system", subtype: "init", session_id: "s1" },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: false }] } },
+      { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } },
+      { type: "result", subtype: "success" },
+    ]));
+    let beats = 0;
+    const events: AgentStreamEvent[] = [];
+    for await (const _ of queryAgent("hi", makeConfig(), undefined, undefined, {
+      onAgentEvent: (e) => events.push(e),
+      onActivity: () => { beats++; },
+    })) {
+      void _;
+    }
+    // One heartbeat per SDK message (5), independent of the 3 AgentStreamEvents
+    // those messages happened to emit.
+    expect(beats).toBe(5);
+  });
+
+  it("a throwing onActivity callback never breaks the stream", async () => {
+    mockQuery.mockReturnValue(createMockStream([
+      { type: "assistant", message: { content: [{ type: "text", text: "hello" }] } },
+      { type: "result", subtype: "success" },
+    ]));
+    const chunks: string[] = [];
+    for await (const c of queryAgent("hi", makeConfig(), undefined, undefined, {
+      onActivity: () => { throw new Error("boom"); },
+    })) {
+      chunks.push(c);
+    }
+    expect(chunks.join("")).toBe("hello");
+  });
+});

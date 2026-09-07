@@ -412,12 +412,28 @@ export interface Config {
   /** Maximum response length in chars before truncation (Q32). */
   maxResponseChars: number;
   /**
-   * Per-message dispatch timeout in ms (#141). Bounds the full handler
-   * pipeline (agent query + stream) under the per-session lock. If a turn
-   * hangs past this, the session lock is released (a hung turn would otherwise
-   * block every subsequent message on that session forever) and the user gets
-   * a one-shot apology. Does NOT cancel the in-flight turn — only unblocks the
-   * queue. Default 5 minutes.
+   * Idle (liveness) timeout in ms — the PRIMARY dispatch bound (activity
+   * watchdog). A turn is judged hung only when its SDK stream has been SILENT
+   * (no assistant / thinking / tool_use / tool_result / result event) longer
+   * than this, NOT when total wall-clock exceeds a fixed budget. A healthy but
+   * slow turn (a long multi-tool run that keeps emitting events) is therefore
+   * never killed, however long it runs. On an idle stall the user gets a
+   * one-shot apology and any per-turn stop hook fires, but the session lock is
+   * KEPT (the in-flight turn keeps running under it, so a follow-up message on
+   * the same session cannot start a concurrent query — it queues). Merged
+   * per-bot like the other top-level fields; clamped to 2**31-1 before use
+   * (#121). 0 disables the idle level. Default 2 minutes.
+   */
+  idleTimeoutMs?: number;
+  /**
+   * Total dispatch backstop in ms (#141), semantically DEMOTED to a large final
+   * ceiling now that {@link idleTimeoutMs} is the primary bound. It guards the
+   * pathological case where events never stop AND the turn never settles (e.g. a
+   * tool loop), or a turn still wedged after the idle notice. This is the ONLY
+   * level that RELEASES the session lock (a hung turn would otherwise block every
+   * subsequent message on that session forever), so it is intentionally large.
+   * Does NOT cancel the in-flight turn — only unblocks the queue. Clamped to
+   * 2**31-1 before use (#121). 0 disables the backstop. Default 30 minutes.
    */
   dispatchTimeoutMs: number;
   botBlocklist?: string[];
@@ -513,6 +529,7 @@ type PartialConfig = {
   rateLimit?: Partial<Config['rateLimit']>;
   context?: Partial<Config['context']>;
   maxResponseChars?: number;
+  idleTimeoutMs?: number;
   dispatchTimeoutMs?: number;
   botBlocklist?: string[];
   allowedBotUids?: string[];
@@ -550,7 +567,8 @@ function defaults(): Config {
       historyLimit: 40,
     },
     maxResponseChars: 524_288, // 512 KB (Q32)
-    dispatchTimeoutMs: 300_000, // 5 min (#141)
+    idleTimeoutMs: 120_000, // 2 min — primary activity-watchdog bound (#141 refit)
+    dispatchTimeoutMs: 1_800_000, // 30 min — large lock-release backstop (#141, demoted)
   };
 }
 
@@ -624,6 +642,7 @@ function mergeConfig(base: Config, override: PartialConfig): Config {
       ...(override.context ?? {}),
     },
     maxResponseChars: override.maxResponseChars ?? base.maxResponseChars,
+    idleTimeoutMs: override.idleTimeoutMs ?? base.idleTimeoutMs,
     dispatchTimeoutMs: override.dispatchTimeoutMs ?? base.dispatchTimeoutMs,
     botBlocklist: override.botBlocklist ?? base.botBlocklist,
     allowedBotUids: override.allowedBotUids ?? base.allowedBotUids,
@@ -855,6 +874,10 @@ export function resolveBotConfigs(config: Config): Config[] {
       mentionFreeGroups:
         perBotFile.mentionFreeGroups ?? bot.mentionFreeGroups ?? config.mentionFreeGroups,
       onBehalfOf: perBotFile.onBehalfOf ?? bot.onBehalfOf ?? config.onBehalfOf,
+      // #141: dispatch bounds honor a per-bot override (else inherit the global
+      // merged value from `...config`), matching the other top-level fields.
+      idleTimeoutMs: perBotFile.idleTimeoutMs ?? config.idleTimeoutMs,
+      dispatchTimeoutMs: perBotFile.dispatchTimeoutMs ?? config.dispatchTimeoutMs,
       groupConfigDir: perBotFile.groupConfigDir ?? config.groupConfigDir,
       serverMd: perBotFile.serverMd ?? config.serverMd,
       serverMdTtlMs: perBotFile.serverMdTtlMs ?? config.serverMdTtlMs,

@@ -93,6 +93,9 @@ describe('loadConfig defaults', () => {
     expect(cfg.context.maxContextChars).toBe(6000);
     expect(cfg.context.historyLimit).toBe(40);
     expect(cfg.botBlocklist).toBeUndefined();
+    // #141 refit: idle (primary) 2 min, dispatch backstop 30 min (demoted).
+    expect(cfg.idleTimeoutMs).toBe(120_000);
+    expect(cfg.dispatchTimeoutMs).toBe(1_800_000);
 
     // Per-bot dirs are derived under <baseDir>/<botId>/… (single bot → default).
     const [bot] = resolveBotConfigs(cfg);
@@ -490,6 +493,26 @@ describe('resolveBotConfigs (two-layer)', () => {
     const [bot] = resolveBotConfigs(cfg);
     expect(bot.botToken).toBe('bf_file');
     expect(bot.sdk.model).toBe('file-model');
+  });
+
+  it('#141: idleTimeoutMs / dispatchTimeoutMs merge per-bot (override wins, else inherit)', () => {
+    const cfg = loadConfig(writeConfig({
+      apiUrl: 'https://a',
+      idleTimeoutMs: 90_000,
+      dispatchTimeoutMs: 2_400_000,
+      bots: [{ id: 'fast' }, { id: 'default-timeouts' }],
+    }));
+    // 'fast' tightens only the idle bound; dispatch backstop inherits the global.
+    writeBotConfig('fast', { botToken: 'bf_1', idleTimeoutMs: 30_000 });
+    // 'default-timeouts' overrides nothing → inherits both global values.
+    writeBotConfig('default-timeouts', { botToken: 'bf_2' });
+    const bots = resolveBotConfigs(cfg);
+    const fast = bots.find((b) => b.botId === 'fast')!;
+    const inherit = bots.find((b) => b.botId === 'default-timeouts')!;
+    expect(fast.idleTimeoutMs).toBe(30_000);
+    expect(fast.dispatchTimeoutMs).toBe(2_400_000); // inherited
+    expect(inherit.idleTimeoutMs).toBe(90_000);
+    expect(inherit.dispatchTimeoutMs).toBe(2_400_000);
   });
 
   it('#110: sdk.skills survives the per-bot config.json load path (per-bot selection)', () => {
