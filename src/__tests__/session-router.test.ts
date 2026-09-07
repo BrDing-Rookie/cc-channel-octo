@@ -887,6 +887,47 @@ describe('idle watchdog (#141 activity-based dispatch bound)', () => {
     expect(started).toEqual([1, 2]);              // turn 2 started only after turn 1 settled
     expect(sendMessage).toHaveBeenCalledTimes(1); // no second apology
   });
+
+  it('(g) total ceiling STILL fires after notifyStreamSettled — a hung post-stream settle is bounded, 2nd same-session turn queues until release', async () => {
+    // PR #21 review #2: notifyStreamSettled must suspend ONLY the idle watchdog.
+    // The total ceiling has to survive the settle so a hung post-stream phase
+    // (delivery / history write / card finalize) is still bounded. idle disabled
+    // to isolate total; short total (30ms).
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 0, dispatchTimeoutMs: 30 }),
+      ROBOT_ID,
+    );
+    const started: number[] = [];
+    let stopped = false;
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
+
+    const p1 = router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'same' }),
+      (result) => {
+        result.onDispatchTimeout = () => { stopped = true; };
+        started.push(1);
+        // Stream drains immediately, but the post-stream settle work hangs past
+        // the total ceiling — total must still fire.
+        result.notifyStreamSettled?.();
+        return hang;
+      },
+    );
+    const p2 = router.routeAndHandle(
+      makeMsg({ message_id: '2', channel_type: ChannelType.DM, from_uid: 'same' }),
+      async () => { started.push(2); },
+    );
+
+    await new Promise((r) => setTimeout(r, 120)); // well past total (30ms), AFTER settle
+    expect(stopped).toBe(true);                    // total fired despite stream settled
+    expect(sendMessage).toHaveBeenCalledTimes(1);  // one total-ceiling apology
+    expect(started).toEqual([1]);                  // 2nd turn still queued (lock held)
+
+    release();
+    await Promise.all([p1, p2]);
+    expect(started).toEqual([1, 2]);               // 2nd runs only after 1st settles
+    expect(sendMessage).toHaveBeenCalledTimes(1);  // no second apology
+  });
 });
 
 // ─── Doc-task egress purity + claim lifecycle (severe fixes 2a / 2b) ─────────

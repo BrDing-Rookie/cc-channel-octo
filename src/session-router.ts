@@ -269,10 +269,13 @@ export class SessionRouter {
    *     on a false alarm; suspended once the stream drains (`notifyStreamSettled`)
    *     so the turn's own settle window (final flush + bookkeeping) is not misread
    *     as a stall.
-   *  2. **total** — `dispatchTimeoutMs`, a large absolute ceiling. Trips when the
-   *     turn is STILL not settled by then (a pathological events-never-stop tool
-   *     loop, or a turn wedged past the idle notice). Feedback only — like idle, it
-   *     keeps the lock. Kept mainly so an idle-disabled config still gets one notice.
+   *  2. **total** — `dispatchTimeoutMs`, a large absolute ceiling and the
+   *     handler's HARD upper bound. Trips once if the handler has not RETURNED by
+   *     then — independent of whether the stream has drained, so it bounds not
+   *     just an events-never-stop tool loop but also a hung POST-stream settle
+   *     (delivery / history write / card finalize). Feedback only — like idle, it
+   *     keeps the lock. Stays armed through the settle window; cleared only when
+   *     the handler actually settles (`finally`).
    *
    * Both ms values are clamped to 2**31-1 (#121) before setTimeout so a large
    * config can't overflow to 1ms and fire on the next tick.
@@ -307,11 +310,14 @@ export class SessionRouter {
     let idleHandle: ReturnType<typeof setTimeout> | undefined;
     let totalHandle: ReturnType<typeof setTimeout> | undefined;
 
-    const clearTimers = (): void => {
+    const clearIdleTimer = (): void => {
       if (idleHandle) {
         clearTimeout(idleHandle);
         idleHandle = undefined;
       }
+    };
+    const clearAllTimers = (): void => {
+      clearIdleTimer();
       if (totalHandle) {
         clearTimeout(totalHandle);
         totalHandle = undefined;
@@ -325,12 +331,16 @@ export class SessionRouter {
       lastEventAt = Date.now();
     };
     result.notifyStreamSettled = () => {
-      // Stream fully drained → the turn is settling. Stop the stall watchdogs so
-      // the naturally-quiet settle window (final flush / history write / card
-      // finalize) is never flagged; the lock is still held until the handler
-      // resolves, so this changes nothing about the concurrency guarantee.
+      // Stream fully drained → the turn is settling. Suspend ONLY the idle
+      // watchdog: the naturally-quiet settle window (final flush / history write /
+      // card finalize) must not read as a stall. The TOTAL ceiling stays armed
+      // until the handler truly returns (cleared in `finally`) — post-stream work
+      // is still "the handler not settled", so a hung settle must remain bounded
+      // by the absolute ceiling (PR #21 review: total = handler's hard upper
+      // bound, independent of when the stream drains). The lock is held until the
+      // handler resolves either way, so the concurrency guarantee is unchanged.
       streamSettled = true;
-      clearTimers();
+      clearIdleTimer();
     };
 
     // Surface the timeout NOTICE at most ONCE (idle first, else total). This never
@@ -368,11 +378,12 @@ export class SessionRouter {
     };
     if (idleMs > 0) idleHandle = setTimeout(onIdleCheck, idleMs);
 
-    // Total ceiling: a one-shot notice if the turn is still unsettled by then.
+    // Total ceiling: the handler's HARD upper bound. Fires once if the handler has
+    // not returned by then — regardless of whether the stream has drained, so a
+    // hung post-stream settle (delivery / history write / card finalize) is bounded
+    // too. Cleared in `finally` when the handler actually settles.
     if (totalMs > 0) {
-      totalHandle = setTimeout(() => {
-        if (!streamSettled) surfaceTimeout('total');
-      }, totalMs);
+      totalHandle = setTimeout(() => surfaceTimeout('total'), totalMs);
     }
 
     try {
@@ -389,7 +400,7 @@ export class SessionRouter {
         `session-router: handler error (session=${result.sessionKey}): ${String(err)}`,
       );
     } finally {
-      clearTimers();
+      clearAllTimers();
     }
   }
 

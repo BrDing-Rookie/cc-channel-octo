@@ -426,15 +426,16 @@ export interface Config {
    */
   idleTimeoutMs?: number;
   /**
-   * Total dispatch ceiling in ms (#141), a large absolute-time fallback now that
-   * {@link idleTimeoutMs} is the primary bound. Trips only if the turn is STILL
-   * unsettled by then (a pathological events-never-stop tool loop, or a turn
-   * wedged past the idle notice). Like the idle level it is FEEDBACK ONLY: it
-   * surfaces a one-shot apology + stop hook but does NOT release the session lock
-   * (a concurrent turn on the same session must never start while the first is
-   * still running — we do not cancel it). Kept mainly so an idle-disabled config
-   * still gets one notice. Clamped to 2**31-1 before use (#121). 0 disables it.
-   * Default 30 minutes.
+   * Total dispatch ceiling in ms (#141) — the handler's HARD upper bound and a
+   * large absolute-time fallback now that {@link idleTimeoutMs} is the primary
+   * bound. Trips once if the handler has not RETURNED by then, independent of
+   * whether the SDK stream has drained — so it bounds not only an
+   * events-never-stop tool loop but also a hung POST-stream settle (final
+   * delivery / history write / card finalize). Like the idle level it is FEEDBACK
+   * ONLY: it surfaces a one-shot apology + stop hook but does NOT release the
+   * session lock (a concurrent turn on the same session must never start while the
+   * first is still running — we do not cancel it). Clamped to 2**31-1 before use
+   * (#121). 0 disables it. Default 30 minutes.
    */
   dispatchTimeoutMs: number;
   botBlocklist?: string[];
