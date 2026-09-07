@@ -35,6 +35,7 @@ import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import type { ChannelType } from './octo/types.js';
 import { CARD_PROFILE, CARD_VERSION } from './octo/types.js';
 import { buildDisplayCard, validateDisplayBlocks } from './card-blocks.js';
+import { resolveSkin } from './card-skins.js';
 import { docTaskImEgressBlockReason } from './doc-task-scope.js';
 import {
   getCardProfile,
@@ -62,6 +63,8 @@ export interface DisplayCardSessionCoords {
 export interface DisplayCardToolConfig {
   apiUrl: string;
   botToken: string;
+  /** /skins: active skin id for this session; maps to the card's density (section spacing). */
+  skin?: string;
 }
 
 function jsonResult(value: unknown): { content: Array<{ type: 'text'; text: string }> } {
@@ -186,6 +189,7 @@ export function buildDisplayCardTools(
             title: rawTitle,
             blocks: validated,
             caps: deriveCardCaps(manifest),
+            density: resolveSkin(config.skin).progress.density,
           });
           const body = (card.body as unknown[]) ?? [];
           if (body.length === 0) {

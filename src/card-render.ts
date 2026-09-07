@@ -10,6 +10,7 @@
 import { CARD_VERSION } from "./octo/types.js";
 import { buildDisplayCard, EN_BUDGET_MARKER, EN_DROP_MARKER, type DisplayBlock, type RichSegment } from "./card-blocks.js";
 import { cardFitsLimits, type CardLimits } from "./card-limits.js";
+import { resolveSkin, type ProgressSkinTokens, type SkinId } from "./card-skins.js";
 
 /**
  * Plain-text fallback for the progress / reasoning card. Deliberately not `CARD_PLACEHOLDER`:
@@ -102,11 +103,18 @@ const TOOL_ICONS: Record<string, string> = {
   octo_management: "💬",
 };
 
-/** 工具名 → 图标 + 原始名称；内部合成步骤使用可读的英文 fallback。 */
-export function resolveToolMeta(tool: string): { icon: string; label: string } {
+/**
+ * 工具名 → 图标 + 原始名称;内部合成步骤使用可读的英文 fallback。
+ *
+ * `sk` (optional) lets a skin override the internal-step icons (Reasoning / Waiting) — e.g. the
+ * terminal skin uses `›`/`⏸`, signal uses dots. When omitted, returns the dashboard/back-compat
+ * emoji set unchanged, so `resolveToolMeta(tool)` keeps its original contract for callers/tests.
+ * The `icon` is only consumed by `stepMarker` in emoji mode; other skins pick glyphs there.
+ */
+export function resolveToolMeta(tool: string, sk?: ProgressSkinTokens): { icon: string; label: string } {
   // 特殊内部 tool 名:agent 一轮 model_call = 一步"思考"(P1-g)。以 __ 前缀,agent 侧无冲突可能。
-  if (tool === "__thinking__") return { icon: "💭", label: "Reasoning" };
-  if (tool === SUBAGENT_WAIT_STEP_TOOL) return { icon: "⏸️", label: "Waiting for subtask" };
+  if (tool === "__thinking__") return { icon: sk?.reasoning ?? "💭", label: "Reasoning" };
+  if (tool === SUBAGENT_WAIT_STEP_TOOL) return { icon: sk?.waiting ?? "⏸️", label: "Waiting for subtask" };
   if (tool.startsWith(MCP_TOOL_PREFIX)) return { icon: "🔌", label: tool };
   return { icon: TOOL_ICONS[tool] ?? "🔧", label: tool };
 }
@@ -1070,34 +1078,35 @@ export function stepLine(step: CardStep): string {
   return `${icon} ${label}${sum}${dur ? ` · ${dur}` : ""}`;
 }
 
-function headerText(state: CardProgressState): string {
+function headerText(state: CardProgressState, sk: ProgressSkinTokens): string {
+  const h = sk.header;
   switch (state.phase) {
     case "thinking":
-      return "🤖 Thinking…";
+      return h.thinking;
     case "tool":
-      return "🤖 Working…";
+      return h.working;
     case "paused":
-      return "⏸️ Waiting for results";
+      return h.paused;
     case "resuming":
-      return "🤖 Preparing results";
+      return h.resuming;
     case "answering":
-      return "🤖 Answering";
+      return h.answering;
     case "expired":
-      return "⏱️ Wait timed out";
+      return h.expired;
     case "error": {
       const detail = sanitizeErrorText(state.errorText);
-      return `⚠️ Interrupted${detail ? `: ${detail}` : ""}`;
+      return `${h.interrupted}${detail ? `: ${detail}` : ""}`;
     }
     case "done": {
       const n = state.steps.length;
       const secs = fmtDuration(state.elapsedMs);
-      const parts = ["✅ Done"];
+      const parts = [h.done];
       if (n > 0) parts.push(`${n} ${n === 1 ? "step" : "steps"}`);
       if (secs) parts.push(secs);
       return parts.join(" · ");
     }
     case "stopped":
-      return "⚠️ Stopped";
+      return h.stopped;
   }
 }
 
@@ -1164,34 +1173,66 @@ function maxVisibleSteps(caps: CardCaps | undefined): number {
  *   状态图标 | label(subtle) | :摘要 | · 耗时/— 错误详情(good/attention 着色)
  * 段拼接后与 `stepLine(step)` 输出完全一致 —— 保证 plain 兜底不变,且降级到 TextBlock 时视觉等价。
  */
-function stepSegments(step: CardStep): RichSegment[] {
-  const { icon, label: rawLabel } = resolveToolMeta(step.tool);
+/**
+ * Per-step leading marker under a skin. `mode` decides the glyph source; `st` is the step so a
+ * dot/ascii skin can choose by status. `metaIcon` is the emoji from resolveToolMeta (dashboard).
+ * A trailing space is included so callers concatenate directly (empty marker → no leading space).
+ */
+function stepMarker(sk: ProgressSkinTokens, st: CardStep, metaIcon: string): string {
+  switch (sk.toolIconMode) {
+    case "emoji":
+      if (st.status === "running") return `${sk.running} `;
+      if (st.status === "error") return `${sk.errorGlyph} `;
+      return `${metaIcon} `;
+    case "ascii": {
+      if (st.tool === "__thinking__") return `${sk.ascii.reason} `;
+      if (st.tool === SUBAGENT_WAIT_STEP_TOOL) return `${sk.ascii.wait} `;
+      if (st.status === "running") return `${sk.ascii.run} `;
+      if (st.status === "error") return `${sk.ascii.err} `;
+      return `${sk.ascii.ok} `;
+    }
+    case "dot":
+      if (st.status === "error") return `${sk.dot.err} `;
+      if (st.status === "running") return `${sk.dot.warn} `;
+      return `${sk.dot.ok} `;
+    case "hidden":
+      return sk.bullet ? `${sk.bullet} ` : "";
+  }
+}
+
+function stepSegments(step: CardStep, sk: ProgressSkinTokens): RichSegment[] {
+  const { icon, label: rawLabel } = resolveToolMeta(step.tool, sk);
   const label = safeLabel(rawLabel);
+  const labelSeg: RichSegment = sk.labelSubtle ? { text: label, subtle: true } : { text: label };
+  // Summaries stay Monospace under every skin — they are file paths / commands / patterns where
+  // fixed-width alignment aids scanning. (Terminal additionally mono's the marker + separators.)
+  const summarySeg = (s: string): RichSegment => ({ text: s, fontType: "Monospace" });
+  const monoText = (t: string): RichSegment => (sk.mono ? { text: t, fontType: "Monospace" } : { text: t });
   const sum = step.summary ? step.summary : "";
   if (step.status === "running") {
     return [
-      { text: "⏳ " },
-      { text: label, subtle: true },
-      ...(sum ? [{ text: ": " }, { text: sum, fontType: "Monospace" as const }] : []),
+      monoText(stepMarker(sk, step, icon)),
+      labelSeg,
+      ...(sum ? [monoText(": "), summarySeg(sum)] : []),
     ];
   }
   if (step.status === "error") {
     const detail = sanitizeErrorText(step.error);
     const segs: RichSegment[] = [
-      { text: "❌ " },
-      { text: label, subtle: true },
-      ...(sum ? [{ text: ": " }, { text: sum, fontType: "Monospace" as const }] : []),
+      monoText(stepMarker(sk, step, icon)),
+      labelSeg,
+      ...(sum ? [monoText(": "), summarySeg(sum)] : []),
     ];
-    if (detail) segs.push({ text: ` — ${detail}`, color: "attention" });
+    if (detail) segs.push({ text: ` — ${detail}`, ...(sk.errorColor ? { color: sk.errorColor } : {}) });
     return segs;
   }
   const dur = fmtDuration(step.durationMs);
   const segs: RichSegment[] = [
-    { text: `${icon} ` },
-    { text: label, subtle: true },
-    ...(sum ? [{ text: ": " }, { text: sum, fontType: "Monospace" as const }] : []),
+    monoText(stepMarker(sk, step, icon)),
+    labelSeg,
+    ...(sum ? [monoText(": "), summarySeg(sum)] : []),
   ];
-  if (dur) segs.push({ text: ` · ${dur}`, color: "good" });
+  if (dur) segs.push({ text: `${sk.sep}${dur}`, ...(sk.durationColor ? { color: sk.durationColor } : {}) });
   return segs;
 }
 
@@ -1200,9 +1241,9 @@ function stepSegments(step: CardStep): RichSegment[] {
  * 显示:`<icon> <label> × N · total <duration> — latest: <last summary>`
  * running/error 步骤不参与合并(单独调 stepSegments),避免糊掉当前重点。
  */
-function groupSegments(group: CardStep[]): RichSegment[] {
+function groupSegments(group: CardStep[], sk: ProgressSkinTokens): RichSegment[] {
   const first = group[0];
-  const { icon, label: rawLabel } = resolveToolMeta(first.tool);
+  const { icon, label: rawLabel } = resolveToolMeta(first.tool, sk);
   const label = safeLabel(rawLabel);
   // 仅在至少一步有耗时时才展示总耗时,否则不显示(避免全 undefined 渲成误导性的「共 0ms」)。
   const anyDuration = group.some((s) => typeof s.durationMs === "number");
@@ -1210,13 +1251,15 @@ function groupSegments(group: CardStep[]): RichSegment[] {
   const dur = anyDuration ? fmtDuration(total) : "";
   const last = group[group.length - 1];
   const lastSum = last.summary ? last.summary : "";
+  const monoText = (t: string): RichSegment => (sk.mono ? { text: t, fontType: "Monospace" } : { text: t });
+  const labelSeg: RichSegment = sk.labelSubtle ? { text: label, subtle: true } : { text: label };
   const segs: RichSegment[] = [
-    { text: `${icon} ` },
-    { text: label, subtle: true },
-    { text: ` × ${group.length}` },
+    monoText(stepMarker(sk, first, icon)),
+    labelSeg,
+    monoText(` × ${group.length}`),
   ];
-  if (dur) segs.push({ text: ` · total ${dur}`, color: "good" });
-  if (lastSum) segs.push({ text: " — latest: " }, { text: lastSum, fontType: "Monospace" });
+  if (dur) segs.push({ text: `${sk.sep}total ${dur}`, ...(sk.durationColor ? { color: sk.durationColor } : {}) });
+  if (lastSum) segs.push(monoText(" — latest: "), { text: lastSum, fontType: "Monospace" });
   return segs;
 }
 
@@ -1267,28 +1310,32 @@ function timelineGroups(steps: CardStep[]): CardStep[][] {
   return groups;
 }
 
-function timelineGroupStyle(group: CardStep[]): "default" | "warning" | "attention" | undefined {
+function timelineGroupStyle(group: CardStep[], sk: ProgressSkinTokens): "default" | "warning" | "attention" | undefined {
+  // Skins that carry state through glyphs (terminal ✗, editorial prose, signal 🔴) drop the
+  // Container tint so the phase reads clean; dashboard keeps it. The spacing hierarchy below
+  // still differentiates active/failed phases regardless.
+  if (!sk.keepGroupStyle) return "default";
   if (group.some((s) => s.status === "error")) return "attention";
   if (group.some((s) => s.status === "running")) return "warning";
   return "default";
 }
 
-function renderStepBlocks(steps: CardStep[]): DisplayBlock[] {
+function renderStepBlocks(steps: CardStep[], sk: ProgressSkinTokens): DisplayBlock[] {
   return groupSteps(steps).map((g) => ({
     type: "rich" as const,
-    segments: g.length > 1 ? groupSegments(g) : stepSegments(g[0]),
+    segments: g.length > 1 ? groupSegments(g, sk) : stepSegments(g[0], sk),
   }));
 }
 
-function renderProgressDetailBlocks(steps: CardStep[], caps: CardCaps | undefined): DisplayBlock[] {
+function renderProgressDetailBlocks(steps: CardStep[], caps: CardCaps | undefined, sk: ProgressSkinTokens): DisplayBlock[] {
   if (supportsTimelineLayout(caps)) {
     return timelineGroups(steps).map((g) => ({
       type: "group" as const,
-      style: timelineGroupStyle(g),
-      blocks: renderStepBlocks(g),
+      style: timelineGroupStyle(g, sk),
+      blocks: renderStepBlocks(g, sk),
     }));
   }
-  return renderStepBlocks(steps);
+  return renderStepBlocks(steps, sk);
 }
 
 function supportsTerminalCollapse(caps: CardCaps | undefined): boolean {
@@ -1300,42 +1347,79 @@ function supportsTerminalCollapse(caps: CardCaps | undefined): boolean {
   );
 }
 
-function progressSummary(steps: CardStep[], total: number): string {
+/**
+ * 进度摘要的结构化拆分:每类活动一个 `{label, count}`。文本行与富样式行都从这一份派生,
+ * 保证「plain 与 rich 的 KPI 数字一定一致」—— 数据只算一次。
+ */
+interface ProgressStat {
+  label: string;
+  count: string;
+}
+
+function progressStats(steps: CardStep[], total: number): ProgressStat[] {
   const thinking = steps.filter((s) => s.tool === "__thinking__").length;
   const waiting = steps.filter((s) => s.tool === SUBAGENT_WAIT_STEP_TOOL).length;
   const tools = total - thinking - waiting;
-  const parts: string[] = [];
-  if (thinking > 0) parts.push(`Reasoning ${thinking}`);
-  if (tools > 0) parts.push(`Tools ${tools}`);
-  if (waiting > 0) parts.push(`Waiting ${waiting}`);
+  const parts: ProgressStat[] = [];
+  if (thinking > 0) parts.push({ label: "Reasoning", count: String(thinking) });
+  if (tools > 0) parts.push({ label: "Tools", count: String(tools) });
+  if (waiting > 0) parts.push({ label: "Waiting", count: String(waiting) });
   // 今天 total === steps.length,三类必占其一;兜底是防 total 日后改成「累计步数」而 steps
   // 只保留窗口时,摘要行静默变空串。
-  if (parts.length === 0) parts.push(`${total} ${total === 1 ? "step" : "steps"}`);
-  return parts.join(" · ");
+  if (parts.length === 0) parts.push({ label: total === 1 ? "step" : "steps", count: String(total) });
+  return parts;
 }
 
-function terminalHeaderSegments(state: CardProgressState): RichSegment[] | null {
+function progressSummary(steps: CardStep[], total: number): string {
+  // 兜底那一条是「N steps」(数字在前),其余是「Reasoning N」(标签在前)。用 label 是否为
+  // step(s) 判断词序,保持与旧输出逐字一致。
+  return progressStats(steps, total)
+    .map((s) => (s.label === "step" || s.label === "steps" ? `${s.count} ${s.label}` : `${s.label} ${s.count}`))
+    .join(" · ");
+}
+
+function terminalHeaderSegments(state: CardProgressState, sk: ProgressSkinTokens): RichSegment[] | null {
   if (state.phase === "done") {
     const n = state.steps.length;
     const secs = fmtDuration(state.elapsedMs);
     const stats = [n > 0 ? `${n} ${n === 1 ? "step" : "steps"}` : "", secs].filter(Boolean).join(" · ");
     return [
-      { text: "✅ Done", bold: true },
+      { text: sk.header.done, bold: true },
       ...(stats ? [{ text: ` · ${stats}`, subtle: true } satisfies RichSegment] : []),
     ];
   }
   if (state.phase === "error") {
     const detail = sanitizeErrorText(state.errorText);
     return [
-      { text: "⚠️ Interrupted", bold: true },
-      ...(detail ? [{ text: `: ${detail}`, color: "attention" } satisfies RichSegment] : []),
+      { text: sk.header.interrupted, bold: true },
+      ...(detail ? [{ text: `: ${detail}`, ...(sk.errorColor ? { color: sk.errorColor } : {}) } satisfies RichSegment] : []),
     ];
   }
   return null;
 }
 
-function progressSummarySegments(steps: CardStep[], total: number): RichSegment[] {
-  return [{ text: progressSummary(steps, total), subtle: true }];
+/**
+ * KPI 摘要行的富样式版本(dataviz stat-strip):每个计数用 skin 的 `countColor`(dashboard=accent)
+ * + 加粗让**数字**跳出来,标签保持 subtle 作陪衬,分隔点 subtle。段拼接后与 `progressSummary`
+ * 逐字一致 —— plain 兜底不变,降级到纯 TextBlock 时也读同一句话。countColor=null 的 skin
+ * (terminal/editorial/signal)只加粗不着色,更克制。
+ */
+function progressSummarySegments(steps: CardStep[], total: number, sk: ProgressSkinTokens): RichSegment[] {
+  const stats = progressStats(steps, total);
+  const segs: RichSegment[] = [];
+  const count = (c: string): RichSegment => (sk.countColor ? { text: c, bold: true, color: sk.countColor } : { text: c, bold: true });
+  stats.forEach((stat, i) => {
+    if (i > 0) segs.push({ text: " · ", subtle: true });
+    const numberFirst = stat.label === "step" || stat.label === "steps";
+    if (numberFirst) {
+      segs.push(count(stat.count));
+      segs.push({ text: ` ${stat.label}`, subtle: true });
+    } else {
+      segs.push({ text: `${stat.label} `, subtle: true });
+      segs.push(count(stat.count));
+    }
+  });
+  return segs;
 }
 
 function richTextBlock(segments: RichSegment[]): Record<string, unknown> {
@@ -1363,8 +1447,8 @@ function textBlock(text: string, opts?: { bold?: boolean; subtle?: boolean; size
   };
 }
 
-function progressHeaderSegments(state: CardProgressState, fallbackHeader: string): RichSegment[] {
-  return terminalHeaderSegments(state) ?? [{ text: fallbackHeader, bold: true }];
+function progressHeaderSegments(state: CardProgressState, fallbackHeader: string, sk: ProgressSkinTokens): RichSegment[] {
+  return terminalHeaderSegments(state, sk) ?? [{ text: fallbackHeader, bold: true }];
 }
 
 function progressSummaryText(steps: CardStep[], total: number): string {
@@ -1377,11 +1461,12 @@ function progressHeaderItems(
   steps: CardStep[],
   total: number,
   canRichText: boolean,
+  sk: ProgressSkinTokens,
 ): Record<string, unknown>[] {
   const items: Record<string, unknown>[] = [];
   if (canRichText) {
-    items.push(richTextBlock(progressHeaderSegments(state, header)));
-    if (total > 0) items.push(richTextBlock(progressSummarySegments(steps, total)));
+    items.push(richTextBlock(progressHeaderSegments(state, header, sk)));
+    if (total > 0) items.push(richTextBlock(progressSummarySegments(steps, total, sk)));
     return items;
   }
   items.push(textBlock(header, { bold: true, size: "Medium" }));
@@ -1443,17 +1528,24 @@ function progressToggleColumn(startVisible: boolean): Record<string, unknown> | 
 export function renderProgressCard(
   state: CardProgressState,
   caps?: CardCaps,
+  skin?: SkinId | string,
 ): {
   card: Record<string, unknown>;
   plain: string;
 } {
-  const header = headerText(state);
+  const sk = resolveSkin(skin).progress;
+  const header = headerText(state, sk);
   const cap = maxVisibleSteps(caps);
   const total = state.steps.length;
   // 只展示最近 cap 步;更早的折叠成一行计数,避免卡片无界膨胀。
   const hidden = Math.max(0, total - cap);
   const visibleSteps = hidden > 0 ? state.steps.slice(-cap) : state.steps;
   const canRichText = cardSupports(caps, "RichTextBlock");
+  // Per-skin timeline spacing: styled (running/error) phases vs settled ones. When a skin drops
+  // the GroupStyle tint (keepGroupStyle=false), every phase is "plain" so this collapses to a
+  // single uniform rhythm — exactly the intent (terminal=tight, editorial=airy).
+  const groupSpacing = (g: CardStep[]): "Small" | "Medium" | "Large" =>
+    (timelineGroupStyle(g, sk) !== "default" ? sk.groupSpacingStyled : sk.groupSpacingPlain);
 
   const renderFlatFallback = (): { card: Record<string, unknown>; plain: string } => {
     // The specialized layout is all-or-nothing. Once either root element is unavailable or
@@ -1468,7 +1560,7 @@ export function renderProgressCard(
     const flatBlocks: DisplayBlock[] = [];
     if (total > 0) flatBlocks.push({ type: "text", text: progressSummaryText(state.steps, total) });
     if (hidden > 0) flatBlocks.push({ type: "text", text: `… ${hidden} earlier steps hidden` });
-    flatBlocks.push(...renderProgressDetailBlocks(visibleSteps, flatCaps));
+    flatBlocks.push(...renderProgressDetailBlocks(visibleSteps, flatCaps, sk));
     const flat = buildDisplayCard({
       title: header,
       blocks: flatBlocks,
@@ -1486,13 +1578,21 @@ export function renderProgressCard(
 
   const detailBlocks: DisplayBlock[] = [];
   if (hidden > 0) detailBlocks.push({ type: "text", text: `… ${hidden} earlier steps hidden` });
-  detailBlocks.push(...renderProgressDetailBlocks(visibleSteps, caps));
+  // Apply the skin's timeline spacing to each phase group (only meaningful when the timeline
+  // layout is active; renderProgressDetailBlocks emits `group` blocks then). We post-process the
+  // emitted blocks to stamp spacing so the density token flows without re-plumbing the builder.
+  const detailBlocksRaw = renderProgressDetailBlocks(visibleSteps, caps, sk);
+  detailBlocks.push(...detailBlocksRaw.map((b, i) =>
+    b.type === "group"
+      ? { ...b, spacing: groupSpacing(timelineGroups(visibleSteps)[i] ?? []) }
+      : b,
+  ));
 
   // trusted:进度卡的每行文案已在上游逐 sink 脱敏(summarizeToolParams/sanitizeErrorText/safeLabel:
   // URL 已降级、path/shell 按 generic=false 保留 git SHA/digest)。buildDisplayCard 默认 generic=true
   // 会二次套用长 hex/高熵检测,误删含哈希的正常行、甚至把错误终态帧整卡清空 —— 故此路径关掉严格 generic。
   const detail = buildDisplayCard({ blocks: detailBlocks, caps, trusted: true, dropMarker: EN_DROP_MARKER, budgetMarker: EN_BUDGET_MARKER });
-  const headerItems = progressHeaderItems(state, header, state.steps, total, canRichText);
+  const headerItems = progressHeaderItems(state, header, state.steps, total, canRichText, sk);
   const canToggle = supportsTerminalCollapse(caps);
   const isTerminal = state.phase === "done" || state.phase === "stopped" || state.phase === "error" || state.phase === "expired";
   const detailVisible = !(canToggle && isTerminal);
@@ -1548,11 +1648,12 @@ export function renderProgressResponseCard(
   state: CardProgressState,
   responseText: string,
   caps?: CardCaps,
+  skin?: SkinId | string,
 ): { card: Record<string, unknown>; plain: string } | null {
   const finalText = responseText.trim();
   if (state.phase !== "done" || !finalText) return null;
 
-  const progress = renderProgressCard(state, caps);
+  const progress = renderProgressCard(state, caps, skin);
   const progressBody = Array.isArray(progress.card.body) ? progress.card.body : [];
   if (progressBody.length === 0) return null;
 

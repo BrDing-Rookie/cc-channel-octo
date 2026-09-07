@@ -84,4 +84,27 @@ describe('card-author.buildInteractiveCard', () => {
     if (r.ok) return;
     expect(r.error).toMatch(/too many buttons/);
   });
+
+  it('gives the interactive card the shared visual hierarchy: title Large, section title Medium', () => {
+    const r = buildInteractiveCard(baseSpec({
+      blocks: [{ type: 'section', title: 'Details', text: 'Deploy v1.2.3 to prod' }],
+    }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const body = r.card.body as Array<Record<string, unknown>>;
+    // Masthead: bold + Large (same as display card title) — the card name is the biggest line.
+    expect(body[0]).toMatchObject({ type: 'TextBlock', text: 'Approve deploy?', weight: 'Bolder', size: 'Large' });
+    // Section title steps down to Medium (between the masthead and body text). It may be nested
+    // inside a Container, so walk the tree.
+    const flat: Record<string, unknown>[] = [];
+    const walk = (n: unknown): void => {
+      if (Array.isArray(n)) return n.forEach(walk);
+      if (n && typeof n === 'object') {
+        flat.push(n as Record<string, unknown>);
+        Object.values(n as Record<string, unknown>).forEach(walk);
+      }
+    };
+    walk(body);
+    expect(flat.some((n) => n.text === 'Details' && n.weight === 'Bolder' && n.size === 'Medium')).toBe(true);
+  });
 });

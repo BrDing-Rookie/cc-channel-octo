@@ -41,6 +41,7 @@ import {
   type InteractiveCardBlockSpec,
   type InteractiveCardSpec,
 } from './card-author.js';
+import { resolveSkin } from './card-skins.js';
 import { registerCardSession } from './card-session.js';
 import { docTaskImEgressBlockReason } from './doc-task-scope.js';
 import {
@@ -72,6 +73,8 @@ export interface InteractiveCardToolConfig {
   botToken: string;
   /** Owning bot id — stored on the card session for the A8 identity check + poll starter. */
   accountId: string;
+  /** /skins: active skin id for this session; maps to the card's density (section spacing). */
+  skin?: string;
 }
 
 function jsonResult(value: unknown): { content: Array<{ type: 'text'; text: string }> } {
@@ -253,8 +256,10 @@ export function buildInteractiveCardTools(
             ...(args.inputs !== undefined ? { inputs: normalizeInputs(args.inputs) } : {}),
           };
           // Baseline build (no caps) validates author content up front and gives the
-          // plain-text degrade its body even when the profile probe fails.
-          const baseline = buildInteractiveCard(spec);
+          // plain-text degrade its body even when the profile probe fails. Density comes from
+          // the active /skins skin (section spacing), consistent with the display/progress cards.
+          const density = resolveSkin(config.skin).progress.density;
+          const baseline = buildInteractiveCard(spec, undefined, density);
           if (!baseline.ok) return errResult(baseline.error);
 
           // D12 capability probe. getCardProfile is fail-closed: a 404 yields
@@ -282,7 +287,7 @@ export function buildInteractiveCardTools(
           let negotiatedCaps: CardCaps | undefined;
           if (!unsupportedReason) {
             negotiatedCaps = deriveInteractiveCardCaps(manifest);
-            const strict = buildInteractiveCard(spec, negotiatedCaps);
+            const strict = buildInteractiveCard(spec, negotiatedCaps, density);
             if (strict.ok) built = strict;
             else unsupportedReason = strict.error;
           }

@@ -57,6 +57,12 @@ export interface ProgressCardContext {
    * resolveReasoningThought before it is ever stored on a step.
    */
   showReasoning?: boolean;
+  /**
+   * /skins: the active card skin id for this session (resolved in index.ts from the session
+   * store → per-bot default → product default). Threaded into renderProgressCard at every frame
+   * so mid-run and terminal frames render in the same skin. Undefined → renderer fallback.
+   */
+  skin?: string;
 }
 
 interface CardEntry {
@@ -424,7 +430,7 @@ async function runFlush(sessionKey: string, entry: CardEntry): Promise<void> {
   // Mid-frame only: transient (kept out of the D10 revision history). The terminal
   // frame is NOT sent from here — once an entry terminalizes it is detached from the
   // `cards` map and drained by {@link deliverTerminal} on its own lifecycle.
-  const { card, plain } = renderProgressCard(progressState(entry), entry.ctx.caps);
+  const { card, plain } = renderProgressCard(progressState(entry), entry.ctx.caps, entry.ctx.skin);
   try {
     if (!entry.messageId) {
       const res = await sendCardMessage({
@@ -556,7 +562,7 @@ async function deliverTerminal(entry: CardEntry): Promise<void> {
   entry.inFlight = true;
   const signal = AbortSignal.timeout(EDIT_TIMEOUT_MS);
   const state = progressState(entry, entry.terminal.phase, entry.terminal.errorText);
-  const { card, plain } = renderProgressCard(state, entry.ctx.caps);
+  const { card, plain } = renderProgressCard(state, entry.ctx.caps, entry.ctx.skin);
   try {
     if (!entry.messageId) {
       const res = await sendCardMessage({

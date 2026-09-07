@@ -188,4 +188,69 @@ describe('handleCommand', () => {
     expect(store.buildHistoryPrefix(KEY, 40)).toContain('keep me');
     expect(store.getResetBarrier(KEY)).toBeUndefined();
   });
+
+  // ── /skins ──────────────────────────────────────────────────────────────
+  it('/skins lists all four skins and marks the active default (editorial) with ★', () => {
+    const r = handleCommand('/skins', KEY, store, config);
+    expect(r.handled).toBe(true);
+    for (const id of ['terminal', 'dashboard', 'editorial', 'signal']) {
+      expect(r.reply).toContain(`\`${id}\``);
+    }
+    // Product default is editorial (no per-bot defaultSkin set) → it carries the ★.
+    expect(r.reply).toMatch(/★ `editorial`/);
+    expect(r.reply).not.toMatch(/★ `terminal`/);
+  });
+
+  it('/skins <id> switches the active skin and persists it per session', () => {
+    const r = handleCommand('/skins terminal', KEY, store, config);
+    expect(r.handled).toBe(true);
+    expect(r.reply).toMatch(/switched to "terminal"/);
+    expect(store.getActiveSkin(KEY)).toBe('terminal');
+    // The listing now marks terminal active.
+    expect(handleCommand('/skins', KEY, store, config).reply).toMatch(/★ `terminal`/);
+  });
+
+  it('/skins accepts the skin3 / positional aliases (owner shorthand)', () => {
+    expect(handleCommand('/skins skin1', KEY, store, config).reply).toMatch(/switched to "terminal"/);
+    expect(store.getActiveSkin(KEY)).toBe('terminal');
+    expect(handleCommand('/skins 4', KEY, store, config).reply).toMatch(/switched to "signal"/);
+    expect(store.getActiveSkin(KEY)).toBe('signal');
+  });
+
+  it('/skins rejects an unknown skin without changing the active one', () => {
+    handleCommand('/skins dashboard', KEY, store, config);
+    const r = handleCommand('/skins neon', KEY, store, config);
+    expect(r.handled).toBe(true);
+    expect(r.reply).toMatch(/unknown skin/i);
+    expect(store.getActiveSkin(KEY)).toBe('dashboard'); // unchanged
+  });
+
+  it('/skins to the already-active skin is a no-op message', () => {
+    handleCommand('/skins signal', KEY, store, config);
+    const r = handleCommand('/skins signal', KEY, store, config);
+    expect(r.reply).toMatch(/already using the "signal" skin/i);
+  });
+
+  it('per-bot sdk.defaultSkin overrides the product default in the listing', () => {
+    const cfg = makeConfig({ defaultSkin: 'terminal' });
+    const r = handleCommand('/skins', KEY, store, cfg);
+    expect(r.reply).toMatch(/★ `terminal`/);
+    expect(r.reply).not.toMatch(/★ `editorial`/);
+  });
+
+  it('a session skin choice survives /reset (skin is a display preference, not history)', () => {
+    handleCommand('/skins terminal', KEY, store, config);
+    store.getOrCreate(KEY, 'ch', 1);
+    store.appendUser(KEY, 'hi', 1);
+    handleCommand('/reset', KEY, store, config, 5);
+    expect(store.buildHistoryPrefix(KEY, 40)).toBe(''); // history cleared
+    expect(store.getActiveSkin(KEY)).toBe('terminal');  // skin kept
+  });
+
+  it('/skins is session-scoped: switching one session does not affect another', () => {
+    handleCommand('/skins terminal', 'group:a', store, config);
+    expect(store.getActiveSkin('group:a')).toBe('terminal');
+    expect(store.getActiveSkin('group:b')).toBeUndefined();
+    expect(handleCommand('/skins', 'group:b', store, config).reply).toMatch(/★ `editorial`/);
+  });
 });

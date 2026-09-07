@@ -908,9 +908,16 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
       { text: " · 2 steps · 3.2s", isSubtle: true },
     ]);
     const summaryBlock = summaryHeader.columns[0].items[1] as { type: string; inlines: Array<Record<string, unknown>> };
+    // KPI stat-strip: each count pops in accent+bold, labels stay subtle, the separator is subtle.
+    // Concatenated text is byte-identical to the plain summary "Reasoning 1 · Tools 1".
     expect(summaryBlock.inlines).toMatchObject([
-      { text: "Reasoning 1 · Tools 1", isSubtle: true },
+      { text: "Reasoning ", isSubtle: true },
+      { text: "1", weight: "Bolder", color: "accent" },
+      { text: " · ", isSubtle: true },
+      { text: "Tools ", isSubtle: true },
+      { text: "1", weight: "Bolder", color: "accent" },
     ]);
+    expect(summaryBlock.inlines.map((i) => i.text).join("")).toBe("Reasoning 1 · Tools 1");
 
     const collapseBtn = summaryHeader.columns[1].items[0] as { id: string; isVisible: boolean; actions: Array<Record<string, unknown>> };
     const expandBtn = summaryHeader.columns[1].items[1] as { id: string; isVisible: boolean; actions: Array<Record<string, unknown>> };
@@ -988,6 +995,58 @@ describe("cardSupports / CardCaps 渲染协商(波 C)", () => {
     expect(body.length).toBeGreaterThan(0);
     expect(body.every((item) => item.type === "TextBlock")).toBe(true);
     expect(card.metadata).toBeUndefined();
+  });
+
+  it("KPI stat-strip 降级:不 advertise RichTextBlock 时数字/标签合成一行 subtle TextBlock,文案不变", () => {
+    // 富样式路径把计数用 accent+bold 挑出来;客户端不支持 RichTextBlock 时(但仍有 ColumnSet/
+    // Container 布局),摘要退回单个 subtle TextBlock,而**同一句话**一字不差 —— 强调是渐进
+    // 增强,信息不依赖它。
+    const caps = { elements: new Set(["TextBlock", "Container", "ColumnSet"]) };
+    const { card, plain } = renderProgressCard(
+      {
+        phase: "tool",
+        steps: [
+          { tool: "__thinking__", status: "done", durationMs: 100 },
+          { tool: "read", status: "done", summary: "/a", durationMs: 50 },
+        ],
+      },
+      caps,
+    );
+    const header = (card.body as Array<Record<string, unknown>>)[0] as {
+      columns: Array<{ items: Array<Record<string, unknown>> }>;
+    };
+    const summaryBlock = header.columns[0].items[1] as { type: string; text: string; isSubtle?: boolean };
+    expect(summaryBlock.type).toBe("TextBlock");
+    expect(summaryBlock.text).toBe("Reasoning 1 · Tools 1");
+    expect(summaryBlock.isSubtle).toBe(true);
+    // rich 专属的强调色不出现在降级路径上。
+    expect(JSON.stringify(card.body)).not.toContain("accent");
+    expect(plain).toContain("Reasoning 1 · Tools 1");
+  });
+
+  it("KPI stat-strip 富样式:计数 accent+bold、标签 subtle,拼接后与 plain 逐字一致", () => {
+    const caps = { elements: new Set(["TextBlock", "RichTextBlock", "Container", "ColumnSet"]) };
+    const { card } = renderProgressCard(
+      {
+        phase: "tool",
+        steps: [
+          { tool: "__thinking__", status: "done", durationMs: 100 },
+          { tool: "read", status: "done", durationMs: 50 },
+          { tool: "read", status: "done", durationMs: 50 },
+        ],
+      },
+      caps,
+    );
+    const header = (card.body as Array<Record<string, unknown>>)[0] as {
+      columns: Array<{ items: Array<Record<string, unknown>> }>;
+    };
+    const summaryRich = header.columns[0].items[1] as { type: string; inlines: Array<Record<string, unknown>> };
+    expect(summaryRich.type).toBe("RichTextBlock");
+    // 每个计数都是 accent + Bolder 的独立 run。
+    const counts = summaryRich.inlines.filter((i) => i.color === "accent");
+    expect(counts.every((i) => i.weight === "Bolder")).toBe(true);
+    expect(counts.map((i) => i.text)).toEqual(["1", "2"]); // Reasoning 1 · Tools 2
+    expect(summaryRich.inlines.map((i) => i.text).join("")).toBe("Reasoning 1 · Tools 2");
   });
 
   it("caps.maxNodes 权威收紧可见步数(比本地上限更严)", () => {
