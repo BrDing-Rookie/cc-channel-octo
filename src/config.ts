@@ -237,6 +237,15 @@ export interface Config {
      */
     progressCard?: boolean;
     /**
+     * `/skins`: the per-bot DEFAULT card skin id — the active visual style a session
+     * uses until a user switches it in-chat with `/skins <id>`. One of
+     * `terminal | dashboard | editorial | signal`. Unset → the product default
+     * (`editorial`, see card-skins.ts DEFAULT_SKIN_ID). An unknown value degrades to
+     * the render fallback rather than erroring. Per-bot (overridable in the per-bot
+     * config file, like the other sdk.* fields).
+     */
+    defaultSkin?: string;
+    /**
      * A7 (partial): when true AND `progressCard` is on, the agent's reasoning /
      * thinking text is captured onto progress steps. Every captured string is
      * 4-state classified + desensitized (see reasoning-thought.ts) before it is

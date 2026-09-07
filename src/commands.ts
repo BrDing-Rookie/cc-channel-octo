@@ -25,6 +25,7 @@
 import type { Config } from './config.js';
 import type { SessionStore } from './session-store.js';
 import { extractParentGroupNo, THREAD_ID_SEPARATOR } from './octo/channel-id.js';
+import { listSkins, parseSkinId, resolveSkin, DEFAULT_SKIN_ID, type SkinId } from './card-skins.js';
 
 /** Result of attempting to handle a command. */
 export interface CommandResult {
@@ -67,9 +68,47 @@ const HELP_TEXT = [
   'Available commands:',
   '• `/reset` — clear the conversation history for this session (the whole group, in a group chat); does not clear long-term memory',
   '• `/config` — show the current session settings',
+  '• `/skins [id]` — list card visual styles, or switch this session to one (terminal / dashboard / editorial / signal)',
   '• `/fork [name]` — (owner, in a group/thread) branch this conversation into a new thread that carries the context so far',
   '• `/help` — show this message',
 ].join('\n');
+
+/**
+ * `/skins` handler. Bare `/skins` lists the registered skins and marks the active one;
+ * `/skins <id>` switches this session's active skin (persisted per session). The default
+ * (when a session has never chosen) is the per-bot `sdk.defaultSkin`, else the product default.
+ * Session-scoped like every other command: in a group, the whole channel shares one skin.
+ */
+export function handleSkinsCommand(
+  args: string,
+  sessionKey: string,
+  store: SessionStore,
+  config: Config,
+): CommandResult {
+  const perBotDefault = resolveSkin(config.sdk.defaultSkin ?? DEFAULT_SKIN_ID).id;
+  const current: SkinId = (store.getActiveSkin(sessionKey) as SkinId | undefined) ?? perBotDefault;
+
+  if (!args) {
+    const lines = ['Card skins (active = ★):'];
+    for (const s of listSkins()) {
+      const mark = s.id === current ? '★' : '•';
+      lines.push(`${mark} \`${s.id}\` — ${s.blurb}`);
+    }
+    lines.push('', 'Switch with `/skins <id>` (e.g. `/skins editorial`).');
+    return { handled: true, reply: lines.join('\n') };
+  }
+
+  const target = parseSkinId(args);
+  if (!target) {
+    const ids = listSkins().map((s) => s.id).join(' / ');
+    return { handled: true, reply: `Unknown skin: "${args}". Choose one of: ${ids}.` };
+  }
+  if (target === current) {
+    return { handled: true, reply: `Already using the "${target}" skin.` };
+  }
+  store.setActiveSkin(sessionKey, target);
+  return { handled: true, reply: `✓ Card skin switched to "${target}". New cards in this session use it.` };
+}
 
 /**
  * Render the effective, non-sensitive per-session configuration. Deliberately
@@ -131,6 +170,9 @@ export function handleCommand(
     }
     case 'config': {
       return { handled: true, reply: renderConfig(config) };
+    }
+    case 'skins': {
+      return handleSkinsCommand(parsed.args, sessionKey, store, config);
     }
     case 'help': {
       return { handled: true, reply: HELP_TEXT };

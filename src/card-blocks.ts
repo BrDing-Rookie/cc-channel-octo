@@ -69,7 +69,7 @@ export type DisplayBlock =
   | { type: "table"; rows: TableRow[]; columns?: TableColumn[]; firstRowAsHeader?: boolean }
   | { type: "columns"; columns: Column[] }
   | { type: "link"; text: string; url: string }
-  | { type: "group"; style?: GroupStyle; blocks: DisplayBlock[] }
+  | { type: "group"; style?: GroupStyle; spacing?: "Small" | "Medium" | "Large"; blocks: DisplayBlock[] }
   | {
       type: "collapsible";
       summary: string;
@@ -100,6 +100,12 @@ export interface BuildDisplayCardOptions {
   dropMarker?: DropMarker;
   /** 归约预算耗尽时的提示;与 dropMarker 同理,英文化的调用方覆盖它。 */
   budgetMarker?: BudgetMarker;
+  /**
+   * 区段留白节奏(heading 上方间距)。由 active skin 传入:terminal=Small(紧凑)、
+   * dashboard/signal=Medium(默认,与历史一致)、editorial=Large(呼吸感)。缺省 Medium,
+   * 保持既有调用方(不传 density)的输出逐字不变。
+   */
+  density?: "Small" | "Medium" | "Large";
 }
 
 /** dropped → 卡面文案 + plain 兜底文案;两者都明确这只是服务端限制额外丢掉的组数。 */
@@ -323,6 +329,8 @@ interface RenderCtx {
   generic: boolean;
   /** 本张卡片剩余的归约预算(字符)。见 REDUCE_BUDGET_PER_CARD。 */
   reduce: { left: number; exhausted: boolean };
+  /** 区段留白节奏(heading 上方间距);缺省 Medium,与历史输出一致。 */
+  density: "Small" | "Medium" | "Large";
 }
 
 function nextId(ctx: RenderCtx, prefix: string): string {
@@ -360,10 +368,10 @@ function renderHeading(text: string, size: "medium" | "large" | undefined, ctx: 
   const clean = sanitize(text, ctx);
   if (!clean) return EMPTY;
   // 设计意图 → AC 属性:heading 是**区段锚点**,靠 (a) size 建立层级(缺省 Medium,`large`
-  // 升到 Large),(b) spacing="Medium" 在它与上一块之间留白,让每个区段有呼吸感。默认正文
-  // 不带 size,所以 heading 一定视觉上高于正文 —— 层级不再只靠加粗这一个信号。
+  // 升到 Large),(b) spacing 在它与上一块之间留白,让每个区段有呼吸感。留白档由 skin 的
+  // density 控制(缺省 Medium,与历史一致)。默认正文不带 size,所以 heading 一定视觉上高于正文。
   return {
-    elements: [textBlock(clean, { bold: true, size: size ?? "medium", spacing: "Medium" })],
+    elements: [textBlock(clean, { bold: true, size: size ?? "medium", spacing: ctx.density })],
     plainLines: [clean],
   };
 }
@@ -583,21 +591,24 @@ function renderGroup(
   style: GroupStyle | undefined,
   blocks: DisplayBlock[],
   ctx: RenderCtx,
+  spacingOverride?: "Small" | "Medium" | "Large",
 ): Rendered {
   const inner = renderBlocks(blocks, ctx);
   if (inner.elements.length === 0) return EMPTY;
   if (cardSupports(ctx.caps, "Container")) {
+    // 设计意图 → AC 属性:分组要与相邻内容拉开留白,否则一段着色 callout 紧贴正文会读成
+    // 背景噪声而非强调。着色容器(good/warning/attention/emphasis)是**语义强调**,给
+    // Medium;中性分组只是逻辑归类,给 Small —— 强调块因此天然比普通分组更"跳"。
+    // 在进度卡时间线里这条规则顺带把 running/error 阶段(warning/attention)与已结算的
+    // default 阶段区分开:出问题/在跑的阶段留白更大,视线自然落到它上面。
+    // `spacingOverride`(进度卡按 skin 密度传入)优先于这条默认,让 skin 统一控制留白节奏。
+    const spacing = spacingOverride ?? (style && style !== "default" ? "Medium" : "Small");
     return {
       elements: [
         {
           type: "Container",
           ...(style && style !== "default" ? { style } : {}),
-          // 设计意图 → AC 属性:分组要与相邻内容拉开留白,否则一段着色 callout 紧贴正文会读成
-          // 背景噪声而非强调。着色容器(good/warning/attention/emphasis)是**语义强调**,给
-          // Medium;中性分组只是逻辑归类,给 Small —— 强调块因此天然比普通分组更"跳"。
-          // 在进度卡时间线里这条规则顺带把 running/error 阶段(warning/attention)与已结算的
-          // default 阶段区分开:出问题/在跑的阶段留白更大,视线自然落到它上面。
-          spacing: style && style !== "default" ? "Medium" : "Small",
+          spacing,
           items: inner.elements,
         },
       ],
@@ -845,7 +856,7 @@ function renderBlock(block: DisplayBlock, ctx: RenderCtx): Rendered {
     case "link":
       return renderLink(block.text, block.url, ctx);
     case "group":
-      return renderGroup(block.style, block.blocks, ctx);
+      return renderGroup(block.style, block.blocks, ctx, block.spacing);
     case "collapsible":
       return renderCollapsibleWithSummary(
         block.summary,
@@ -878,7 +889,7 @@ function renderBlocks(blocks: DisplayBlock[], ctx: RenderCtx): Rendered {
  * plain = 纯文本兜底(与布局无关,服务端 Finalize 会权威重算)。
  */
 export function buildDisplayCard(opts: BuildDisplayCardOptions): BuildDisplayCardResult {
-  const { title, blocks, caps, trusted, dropMarker = DEFAULT_DROP_MARKER, budgetMarker = DEFAULT_BUDGET_MARKER } = opts;
+  const { title, blocks, caps, trusted, dropMarker = DEFAULT_DROP_MARKER, budgetMarker = DEFAULT_BUDGET_MARKER, density = "Medium" } = opts;
   // Every currently supported block either is TextBlock or degrades through TextBlock.
   // An explicitly advertised capability set without TextBlock has no safe output shape.
   if (caps?.elements !== undefined && !cardSupports(caps, "TextBlock")) {
@@ -887,6 +898,7 @@ export function buildDisplayCard(opts: BuildDisplayCardOptions): BuildDisplayCar
   const ctx: RenderCtx = {
     caps, uid: { n: 0 }, generic: !trusted,
     reduce: { left: REDUCE_BUDGET_PER_CARD, exhausted: false },
+    density,
   };
   const groups: Rendered[] = [];
   let cleanTitle = "";

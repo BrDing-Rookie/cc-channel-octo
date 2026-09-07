@@ -85,6 +85,17 @@ CREATE TABLE IF NOT EXISTS forked_sessions (
   created_at INTEGER NOT NULL
 );
 
+-- /skins: the active card skin id per session (runtime-switchable visual style).
+-- Separate table mirroring sdk_sessions: a small per-session string with its own
+-- lifecycle. Survives /reset (a skin is a display preference, not conversation
+-- state) and process restarts. Absent row → fall back to the per-bot default
+-- (config.sdk.defaultSkin) resolved in index.ts. No TTL: a skin never expires.
+CREATE TABLE IF NOT EXISTS session_skins (
+  session_id TEXT PRIMARY KEY,
+  skin_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
 `;
 
@@ -118,6 +129,8 @@ export class SessionStore {
   private deleteExpiredSdkSessions!: PreparedStatement;
   private upsertForkParent!: PreparedStatement;
   private selectForkParent!: PreparedStatement;
+  private upsertSessionSkin!: PreparedStatement;
+  private selectSessionSkin!: PreparedStatement;
 
   /** Tracks the last message_seq at which the bot replied, per group session key. */
   private lastBotReplySeq = new Map<string, number>();
@@ -223,6 +236,14 @@ export class SessionStore {
     );
     this.selectForkParent = this.adapter.prepare(
       'SELECT parent_session_id FROM forked_sessions WHERE child_session_id = ?',
+    );
+    this.upsertSessionSkin = this.adapter.prepare(
+      'INSERT INTO session_skins (session_id, skin_id, updated_at) VALUES (?, ?, ?) ' +
+        'ON CONFLICT(session_id) DO UPDATE SET skin_id = excluded.skin_id, ' +
+        'updated_at = excluded.updated_at',
+    );
+    this.selectSessionSkin = this.adapter.prepare(
+      'SELECT skin_id FROM session_skins WHERE session_id = ?',
     );
   }
 
@@ -430,6 +451,25 @@ export class SessionStore {
       | { parent_session_id: string }
       | undefined;
     return row?.parent_session_id;
+  }
+
+  /**
+   * /skins: set the active card skin id for a session. Upsert (latest wins). The
+   * value is an opaque string here — validation (against the skin registry) lives
+   * in the command layer; a stale/unknown id degrades to the fallback at render.
+   */
+  setActiveSkin(sessionId: string, skinId: string): void {
+    this.upsertSessionSkin.run(sessionId, skinId, Date.now());
+  }
+
+  /**
+   * /skins: the active skin id for a session, or undefined if none was chosen (the
+   * caller then applies the per-bot default). Cheap indexed lookup; read once per
+   * turn at the render seam. NOT cleared by /reset — a skin is a display preference.
+   */
+  getActiveSkin(sessionId: string): string | undefined {
+    const row = this.selectSessionSkin.get(sessionId) as { skin_id: string } | undefined;
+    return row?.skin_id;
   }
 
   close(): void {

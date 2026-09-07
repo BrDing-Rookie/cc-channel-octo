@@ -78,3 +78,57 @@ Visual goal: the decision question is unmistakable; options are scannable.
 octo/v1 whitelist (400 risk) or carry no accessible light/dark guarantee. Every choice here is one
 of the five verified attributes, each attached to an element that already degrades cleanly — so the
 beautification is pure progressive enhancement over the existing, safe baseline.
+
+---
+
+# `/skins` — switchable card skins
+
+The single visual language above is now one of **four owner-approved skins**, switchable at
+runtime with the `/skins` in-chat command. A *skin* re-arranges the **same octo/v1 whitelist
+bricks** into a different **skeleton / graphic language / density** — the three "free, high-impact"
+axes. **No skin relaxes the three protocol edges** the owner chose to keep closed: **no hex, no
+custom fonts, no separator/border**. So every skin degrades through CardCaps and desensitization
+exactly like the baseline, and none can produce a server-400 structure. (`src/card-skins.ts` holds
+the token bundles; `card-render.ts` reads them; `card-blocks.ts` / the display + interactive tools
+read only the `density` hint.)
+
+## The four skins (design intent → AC attributes)
+
+| Skin | Skeleton / glyph / density | AC attributes it pulls |
+|------|----------------------------|------------------------|
+| **terminal** | monospace CLI-log · ASCII glyphs (`▶ ✓ ✗ ›`) · `[tag]` headers · compact | `fontType:"Monospace"` on every run · ASCII text glyphs · `spacing:Small` · no color except `attention` on errors |
+| **dashboard** | emoji status · per-tool emoji · accent KPI counts · color-coded · cozy | emoji text · `color:"accent"` counts · `color:"good"/"attention"` · `GroupStyle` tint kept · `spacing:Medium` |
+| **editorial** *(default)* | no leading glyphs · subtle bullets · restrained color · airy | plain-word headers · `isSubtle` · `spacing:Large` · GroupStyle tint dropped |
+| **signal** | traffic-light dots (`🟢🟡🔴`) carry state · one badge per line · cozy | status dot text glyphs · minimal extra color · `spacing:Medium` |
+
+Everything above is expressed only via `weight` / `size` / `spacing` / `wrap` / `isSubtle` /
+`fontType:Monospace` / the semantic colors / `GroupStyle` + plain-text glyph systems. The glyph
+system is the biggest differentiator and is **free** (emoji/ASCII/Unicode are just text).
+
+**dashboard is special:** its token bundle reproduces the *pre-skin* renderer output byte-for-byte.
+It is therefore the library **fallback** when no skin is passed (keeping the entire prior test
+corpus valid), even though the **product default is `editorial`** (owner decision). The two are
+deliberately separate: `FALLBACK_SKIN_ID = dashboard` (structural back-compat) vs
+`DEFAULT_SKIN_ID = editorial` (what a live session renders with).
+
+## What a skin does NOT change
+
+- **Root shape** stays `[ColumnSet, Container#timeline_detail]` — the `agent_progress_v1` client
+  contract. Skins vary *content treatment* (glyphs, density, header/summary, step-row style, phase
+  tint) inside that stable envelope, never the skeleton the client parses.
+- **Degradation**: on a TextBlock-only client every skin collapses to flat rows with the same
+  information, no metadata, no color, no 400 (see `card-skins.test.ts` and the per-skin
+  full-caps-vs-degraded proof images on the issue).
+- **Desensitization**: unchanged — skins only touch structure/markers around already-sanitized
+  text. The `card-render.corpus` LEAK/COST/PARITY snapshots are untouched.
+
+## Usage & default
+
+- `/skins` — list the four skins; the active one is marked `★`.
+- `/skins <id>` — switch this session's active skin (`terminal` / `dashboard` / `editorial` /
+  `signal`; the `skin3` / `3` positional aliases also work). Persisted per session in the
+  `session_skins` table; **survives `/reset`** (a skin is a display preference, not history).
+- **Default**: a session with no explicit choice uses the per-bot `sdk.defaultSkin`, else the
+  product default **`editorial`**. Resolved once per turn in `index.ts` (session store → per-bot
+  config → product default) and threaded into all three renderers. An unknown stored/config value
+  degrades to the fallback rather than erroring.

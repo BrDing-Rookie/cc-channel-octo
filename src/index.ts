@@ -41,6 +41,7 @@ import { resolveContent, tryResolveFile, resolveHistoricalMessagePlaceholder } f
 import { downloadInboundImage, MAX_IMAGES_PER_MESSAGE } from './media-inbound.js';
 import { handleCommand, parseCommand, handleForkCommand } from './commands.js';
 import type { CommandResult } from './commands.js';
+import { DEFAULT_SKIN_ID } from './card-skins.js';
 import { resolveGroupInstructions } from './group-md.js';
 import { GroupMdCache, ThreadMdCache, DEFAULT_GROUP_MD_TTL_MS } from './group-md-cache.js';
 import { MentionPrefCache, DEFAULT_MENTION_PREF_TTL_MS } from './mention-pref-cache.js';
@@ -634,6 +635,14 @@ export async function handleMessage(
   const routeResult = await router.routeAndHandle(msg, async (result) => {
     wasProcessed = true;
     const { sessionKey } = result;
+    // /skins: resolve the active card skin ONCE per turn here, where sessionKey + store +
+    // config are all in scope, and thread it into all three card renderers (progress / display /
+    // interactive). Precedence: session choice (store) → per-bot default (config.sdk.defaultSkin)
+    // → product default (card-skins DEFAULT_SKIN_ID). An unknown stored/config value degrades to
+    // the render fallback, so this can never throw or blank a card.
+    const activeSkin: string = store.getActiveSkin(sessionKey)
+      ?? config.sdk.defaultSkin
+      ?? DEFAULT_SKIN_ID;
     // D1: a genuine doc-comment task (authentic `_docTask` nonce). When set, the
     // reply is routed to the doc-comment sink and EVERY IM egress side-effect
     // below is bypassed by construction (the channel id is a non-routable
@@ -1150,6 +1159,7 @@ export async function handleMessage(
             channelType,
             ...(caps ? { caps } : {}),
             ...(config.sdk.showReasoning ? { showReasoning: true } : {}),
+            skin: activeSkin,
           });
         }
       }
@@ -1269,7 +1279,7 @@ export async function handleMessage(
       if (config.sdk.displayCard && config.botToken && config.apiUrl) {
         const coords: DisplayCardSessionCoords = { channelId, channelType };
         const displayCardServer = createDisplayCardToolServer(
-          { apiUrl: config.apiUrl, botToken: config.botToken },
+          { apiUrl: config.apiUrl, botToken: config.botToken, skin: activeSkin },
           coords,
         );
         sessionOpts = {
@@ -1287,7 +1297,7 @@ export async function handleMessage(
       if (config.sdk.sendCard && config.botToken && config.apiUrl && config.botId) {
         const coords: InteractiveCardSessionCoords = { channelId, channelType };
         const interactiveCardServer = createInteractiveCardToolServer(
-          { apiUrl: config.apiUrl, botToken: config.botToken, accountId: config.botId },
+          { apiUrl: config.apiUrl, botToken: config.botToken, accountId: config.botId, skin: activeSkin },
           coords,
           sessionKey,
         );

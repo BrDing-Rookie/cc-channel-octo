@@ -143,6 +143,7 @@ function sanitizeData(value: unknown, key = "", depth = 0): unknown {
 export function buildInteractiveCard(
   spec: InteractiveCardSpec,
   caps?: CardCaps,
+  density: "Small" | "Medium" | "Large" = "Medium",
 ): BuiltInteractiveCard | BuildFailure {
   const titleResult = cleanTextWithReason(spec.title, MAX_TITLE);
   if (!("text" in titleResult)) return failure(`title ${titleResult.reason}`);
@@ -234,7 +235,7 @@ export function buildInteractiveCard(
         }
         plainLines.push(...cleanFacts.map((fact) => `${fact.title}：${fact.value}`));
       }
-      if (cardSupports(caps, "Container")) body.push({ type: "Container", items, spacing: "Medium" });
+      if (cardSupports(caps, "Container")) body.push({ type: "Container", items, spacing: density });
       else body.push(...items);
       continue;
     }
