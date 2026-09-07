@@ -307,7 +307,7 @@ export async function* queryAgent(
   config: Config,
   sessionCtx?: SessionCtx,
   onToolUse?: (toolName: string, toolInput?: unknown) => void,
-  opts?: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; personaHint?: string; onAgentEvent?: (event: AgentStreamEvent) => void },
+  opts?: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; personaHint?: string; onAgentEvent?: (event: AgentStreamEvent) => void; onActivity?: () => void },
 ): AsyncIterable<string> {
   const permissionMode = toPermissionMode(config.sdk.permissionMode);
   const settingSources = toSettingSources(config.sdk.settingSources);
@@ -353,6 +353,19 @@ export async function* queryAgent(
       opts.onAgentEvent(event);
     } catch (err) {
       console.error(`[cc-channel-octo] onAgentEvent callback threw: ${String(err)}`);
+    }
+  };
+
+  // #141 (activity watchdog): every SDK message is a "still running" heartbeat.
+  // Fired once per drained message (any type) so the session-router's idle
+  // watchdog treats a healthy-but-slow turn as alive and never kills it. A
+  // throwing consumer must never break the SDK stream, so it is guarded.
+  const emitActivity = (): void => {
+    if (!opts?.onActivity) return;
+    try {
+      opts.onActivity();
+    } catch (err) {
+      console.error(`[cc-channel-octo] onActivity callback threw: ${String(err)}`);
     }
   };
 
@@ -435,6 +448,9 @@ export async function* queryAgent(
     let reportedSessionId = false;
     try {
       for await (const message of s) {
+        // #141: heartbeat FIRST, for every message type (even a bare system /
+        // session-id-only message), so the idle watchdog sees the turn as alive.
+        emitActivity();
         if (!reportedSessionId && opts?.onSessionId) {
           const sid = (message as { session_id?: string }).session_id;
           if (typeof sid === 'string' && sid) {

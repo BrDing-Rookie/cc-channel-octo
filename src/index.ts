@@ -1173,9 +1173,15 @@ export async function handleMessage(
       // queryAgent recovers by calling onResumeFailed (clear the bad id) and
       // retrying once with the pre-assembled fallbackRetryPrompt so the
       // conversation isn't lost (and assembly happens exactly once — see above).
-      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; personaHint?: string; onAgentEvent?: (event: AgentStreamEvent) => void } | undefined = {
+      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; personaHint?: string; onAgentEvent?: (event: AgentStreamEvent) => void; onActivity?: () => void } | undefined = {
         ...(resume ? { resume } : {}),
         onSessionId: (id: string) => store.setSdkSessionId(sessionKey, id),
+        // #141: forward every SDK stream event to the session-router's idle
+        // watchdog as a "still running" heartbeat. Independent of the progress
+        // card — always on — so a healthy-but-slow turn (long multi-tool run that
+        // keeps emitting events) refreshes the liveness beacon and is never judged
+        // hung. `result.notifyActivity` is a no-op when the dispatch timeout is off.
+        onActivity: () => result.notifyActivity?.(),
         // E1: inject the persona-clone hint (grantor's persona_prompt) into the
         // frozen system prompt when this bot is a persona clone with an active
         // grant. Read from the OBO-grant cache keyed by this bot's id; undefined
@@ -1448,9 +1454,18 @@ export async function handleMessage(
       // Tee the generator: collect full text while streaming to Octo
       const collected: string[] = [];
       async function* teeChunks(): AsyncIterable<string> {
-        for await (const chunk of rawChunks) {
-          collected.push(chunk);
-          yield chunk;
+        try {
+          for await (const chunk of rawChunks) {
+            collected.push(chunk);
+            yield chunk;
+          }
+        } finally {
+          // #141: the SDK stream has fully drained — signal the idle watchdog to
+          // suspend. Any quiet after this is the turn's natural settle (final
+          // flush / history write / card finalize), NOT a stall, so it must not be
+          // judged hung; only the large total backstop guards the settle window.
+          // No-op when the dispatch timeout is off (doc-task / disabled path).
+          result.notifyStreamSettled?.();
         }
       }
 

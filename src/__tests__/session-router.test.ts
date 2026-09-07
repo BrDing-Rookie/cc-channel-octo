@@ -523,47 +523,67 @@ describe('dispatch timeout (#141)', () => {
     vi.clearAllMocks();
   });
 
-  it('a hung handler does not block the next message on the same session', async () => {
+  it('a hung turn HOLDS the session lock — a same-session message queues until it settles (never concurrent)', async () => {
+    // Reworked for the #141 refit (PR #21 review): we never cancel the in-flight
+    // turn, so we must never release the lock while it runs — otherwise a
+    // follow-up message would start a CONCURRENT query() on the same SDK session.
+    // The old assertion (message 2 runs after the timeout) codified that unsafe
+    // behavior; the correct behavior is that message 2 stays QUEUED until the turn
+    // truly settles.
     const router = new SessionRouter(
-      makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 50 }),
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 30, dispatchTimeoutMs: 10_000 }),
       ROBOT_ID,
     );
     const completed: number[] = [];
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
 
-    // Message 1: handler never resolves (simulates a hung agent turn).
+    // Message 1: a stalled turn — silent (no activity), never settles until released.
     const p1 = router.routeAndHandle(
       makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'same-user' }),
-      () => new Promise<void>(() => { /* never resolves */ }),
+      () => hang,
     );
-
-    // Message 2: a normal fast handler on the SAME session. Without the
-    // timeout it would be blocked forever behind message 1's session lock.
+    // Message 2: same session — must NOT start while message 1 is still running.
     const p2 = router.routeAndHandle(
       makeMsg({ message_id: '2', channel_type: ChannelType.DM, from_uid: 'same-user' }),
       async () => { completed.push(2); },
     );
 
-    await Promise.all([p1, p2]);
+    // Past idle (30ms), well under total (10s): message 1 got its apology, but the
+    // lock is still held, so message 2 has NOT run.
+    await new Promise((r) => setTimeout(r, 120));
+    expect(completed).toEqual([]);
+    expect(sendMessage).toHaveBeenCalledTimes(1); // idle apology for message 1
 
-    // Message 2 ran — the lock was released after message 1 timed out.
+    // The stalled turn settles → lock frees → message 2 finally runs (serially).
+    release();
+    await Promise.all([p1, p2]);
     expect(completed).toEqual([2]);
+    expect(sendMessage).toHaveBeenCalledTimes(1); // no second apology on settle
   });
 
-  it('sends a single bounded apology on timeout', async () => {
+  it('surfaces a single bounded apology on an idle stall (lock still held)', async () => {
     const router = new SessionRouter(
-      makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 30 }),
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 30, dispatchTimeoutMs: 10_000 }),
       ROBOT_ID,
     );
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
 
-    await router.routeAndHandle(
+    const p = router.routeAndHandle(
       makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
-      () => new Promise<void>(() => { /* never resolves */ }),
+      () => hang,
     );
 
+    await new Promise((r) => setTimeout(r, 120));
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(vi.mocked(sendMessage).mock.calls[0][0]).toMatchObject({
       content: expect.stringContaining('处理超时'),
     });
+
+    release();
+    await p;
+    expect(sendMessage).toHaveBeenCalledTimes(1); // exactly one, even after settle
   });
 
   it('does not fire for a normal fast handler', async () => {
@@ -598,26 +618,32 @@ describe('dispatch timeout (#141)', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  it('invokes a handler-registered onDispatchTimeout hook on timeout (A6: card → stopped)', async () => {
+  it('invokes a handler-registered onDispatchTimeout hook on a stall (A6: card → stopped)', async () => {
     const router = new SessionRouter(
-      makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 30 }),
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 30, dispatchTimeoutMs: 10_000 }),
       ROBOT_ID,
     );
     let stopped = false;
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
 
-    await router.routeAndHandle(
+    const p = router.routeAndHandle(
       makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
       (result) => {
         // The handler registers a per-turn stop hook (as index.ts does for the
-        // progress card) and then hangs — the timeout must invoke the hook.
+        // progress card) and then stalls — the timeout must invoke the hook.
         result.onDispatchTimeout = () => { stopped = true; };
-        return new Promise<void>(() => { /* never resolves */ });
+        return hang;
       },
     );
 
+    await new Promise((r) => setTimeout(r, 120));
     expect(stopped).toBe(true);
-    // The apology still goes out exactly once alongside the hook.
+    // The apology goes out exactly once alongside the hook.
     expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    release();
+    await p;
   });
 
   it('does not invoke onDispatchTimeout for a normal fast handler', async () => {
@@ -656,6 +682,251 @@ describe('dispatch timeout (#141)', () => {
     expect(completed).toEqual([2]);
     // A non-timeout error must NOT trigger the timeout apology.
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+// ─── #141 refit: activity (idle) watchdog ──────────────────────────────────
+
+describe('idle watchdog (#141 activity-based dispatch bound)', () => {
+  const IDLE_DOC_BOT = 'bot_idle_1';
+  const idleDocMention = parseDocCommentMention({
+    event_id: 9,
+    event_type: 'doc_comment_mention',
+    event_data: {
+      idempotency_key: 'idem-idle', doc_id: 'doc_9', comment_id: 'c9', thread_id: '99',
+      from_uid: 'u_author', bot_uid: IDLE_DOC_BOT, text: 'fix it',
+    },
+  })!;
+  const idleDocCtx: DocTaskContext = {
+    docId: idleDocMention.docId, threadId: idleDocMention.threadId, commentId: idleDocMention.commentId,
+    sessionScope: docTaskSessionScope(idleDocMention), postComment: async () => {}, reportTurn: () => {},
+  };
+  const idleDocFire = (): BotMessage => synthesizeDocMentionMessage(idleDocMention, IDLE_DOC_BOT, idleDocCtx);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('(a) never judges a healthy-but-slow turn hung while it keeps emitting events', async () => {
+    // idle=40ms, total=10s. The handler beats the activity beacon every 15ms for
+    // ~120ms — total wall-clock (120ms) far exceeds idle (40ms), but no single
+    // gap does, so a fixed wall-clock timer would have killed it and the activity
+    // watchdog must not.
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 40, dispatchTimeoutMs: 10_000 }),
+      ROBOT_ID,
+    );
+    let finished = false;
+
+    await router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      async (result) => {
+        for (let i = 0; i < 8; i++) {
+          result.notifyActivity?.(); // "still running" heartbeat
+          await new Promise((r) => setTimeout(r, 15));
+        }
+        result.notifyStreamSettled?.();
+        finished = true;
+      },
+    );
+
+    expect(finished).toBe(true);
+    expect(sendMessage).not.toHaveBeenCalled(); // never judged hung
+  });
+
+  it('(b) an idle stall surfaces feedback + the stop hook but KEEPS the lock (no concurrent turn)', async () => {
+    // idle=30ms, total=10s. Message 1 goes silent immediately (no heartbeats) →
+    // idle notice fires, but the lock is NOT released (no timeout level releases
+    // it — the turn is never cancelled, so it runs to completion in-lock), so a
+    // same-session message 2 stays QUEUED — never starts a concurrent turn.
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 30, dispatchTimeoutMs: 10_000 }),
+      ROBOT_ID,
+    );
+    const log: string[] = [];
+    let releaseHang!: () => void;
+    const hang = new Promise<void>((r) => { releaseHang = r; });
+
+    const p1 = router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'same' }),
+      (result) => {
+        result.onDispatchTimeout = () => log.push('stop-hook');
+        return hang; // silent + never settles until we release it
+      },
+    );
+    const p2 = router.routeAndHandle(
+      makeMsg({ message_id: '2', channel_type: ChannelType.DM, from_uid: 'same' }),
+      async () => { log.push('msg2-ran'); },
+    );
+
+    // Past idle (30ms), well under total (10s).
+    await new Promise((r) => setTimeout(r, 120));
+
+    expect(sendMessage).toHaveBeenCalledTimes(1); // one idle apology
+    expect(vi.mocked(sendMessage).mock.calls[0][0]).toMatchObject({
+      content: expect.stringContaining('处理超时'),
+    });
+    expect(log).toContain('stop-hook'); // onDispatchTimeout fired at the idle notice
+    expect(log).not.toContain('msg2-ran'); // lock held → message 2 still queued
+
+    // Release the wedged turn → lock frees → message 2 finally runs. No second apology.
+    releaseHang();
+    await Promise.all([p1, p2]);
+    expect(log).toContain('msg2-ran');
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('(c) does not mistake the post-stream settle window for a stall', async () => {
+    // The stream drains (one event, then notifyStreamSettled), then the turn stays
+    // quiet for 120ms of settle/post-work — longer than idle (30ms). Because the
+    // stream has settled, the idle watchdog is suspended and no apology is sent.
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 30, dispatchTimeoutMs: 10_000 }),
+      ROBOT_ID,
+    );
+    let finished = false;
+
+    await router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      async (result) => {
+        result.notifyActivity?.();      // one stream event
+        result.notifyStreamSettled?.(); // stream fully drained → suspend idle watchdog
+        await new Promise((r) => setTimeout(r, 120)); // quiet settle window > idle
+        finished = true;
+      },
+    );
+
+    expect(finished).toBe(true);
+    expect(sendMessage).not.toHaveBeenCalled(); // settle window is not a stall
+  });
+
+  it('(d) clamps an oversized backstop so it does not overflow setTimeout to ~1ms (#121)', async () => {
+    // dispatchTimeoutMs beyond 2**31-1 must be clamped: an unclamped value is
+    // coerced by Node to a 1ms delay, firing the backstop on the next tick and
+    // apologizing to every message. Idle disabled to isolate the total backstop.
+    const router = new SessionRouter(
+      makeConfig({
+        rateLimit: { maxPerMinute: 100 },
+        idleTimeoutMs: 0,
+        dispatchTimeoutMs: 2 ** 31 + 5_000, // > 2**31-1
+      }),
+      ROBOT_ID,
+    );
+    let finished = false;
+
+    await router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      async () => {
+        await new Promise((r) => setTimeout(r, 60));
+        finished = true;
+      },
+    );
+
+    expect(finished).toBe(true);
+    expect(sendMessage).not.toHaveBeenCalled(); // unclamped, the backstop would fire at ~1ms
+  });
+
+  it('(e) idle watchdog is inert for a doc task (force-await path is unchanged)', async () => {
+    // A doc fire must ignore both timeout levels and bind to the real turn settle
+    // (severe fix 2b). The idle watchdog must not release or apologize for it.
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 20, dispatchTimeoutMs: 40 }),
+      IDLE_DOC_BOT,
+    );
+    let handlerSettled = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+
+    const p = router.routeAndHandle(idleDocFire(), async () => {
+      await gate; // outlives both idle (20ms) and total (40ms)
+      handlerSettled = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 90)); // past both levels
+    let resolvedEarly = false;
+    void p.then(() => { resolvedEarly = true; });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(resolvedEarly).toBe(false); // still bound to the real turn
+    expect(handlerSettled).toBe(false);
+    expect(sendMessage).not.toHaveBeenCalled(); // no IM apology for a doc task
+
+    release();
+    await p;
+    expect(handlerSettled).toBe(true);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('(f) total-ceiling stall (idle disabled) keeps the lock — 2nd same-session query does not start until the 1st settles', async () => {
+    // PR #21 review regression: with idle disabled, the total ceiling is the only
+    // trip, and it must ALSO keep the lock (never release). A second same-session
+    // message must not start its turn (its query) until the first turn settles.
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 0, dispatchTimeoutMs: 30 }),
+      ROBOT_ID,
+    );
+    const started: number[] = [];
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
+
+    const p1 = router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'same' }),
+      () => { started.push(1); return hang; },
+    );
+    const p2 = router.routeAndHandle(
+      makeMsg({ message_id: '2', channel_type: ChannelType.DM, from_uid: 'same' }),
+      async () => { started.push(2); },
+    );
+
+    await new Promise((r) => setTimeout(r, 120)); // well past total (30ms)
+    expect(started).toEqual([1]);                 // turn 2 has NOT started
+    expect(sendMessage).toHaveBeenCalledTimes(1); // total-ceiling apology
+
+    release();
+    await Promise.all([p1, p2]);
+    expect(started).toEqual([1, 2]);              // turn 2 started only after turn 1 settled
+    expect(sendMessage).toHaveBeenCalledTimes(1); // no second apology
+  });
+
+  it('(g) total ceiling STILL fires after notifyStreamSettled — a hung post-stream settle is bounded, 2nd same-session turn queues until release', async () => {
+    // PR #21 review #2: notifyStreamSettled must suspend ONLY the idle watchdog.
+    // The total ceiling has to survive the settle so a hung post-stream phase
+    // (delivery / history write / card finalize) is still bounded. idle disabled
+    // to isolate total; short total (30ms).
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 0, dispatchTimeoutMs: 30 }),
+      ROBOT_ID,
+    );
+    const started: number[] = [];
+    let stopped = false;
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
+
+    const p1 = router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'same' }),
+      (result) => {
+        result.onDispatchTimeout = () => { stopped = true; };
+        started.push(1);
+        // Stream drains immediately, but the post-stream settle work hangs past
+        // the total ceiling — total must still fire.
+        result.notifyStreamSettled?.();
+        return hang;
+      },
+    );
+    const p2 = router.routeAndHandle(
+      makeMsg({ message_id: '2', channel_type: ChannelType.DM, from_uid: 'same' }),
+      async () => { started.push(2); },
+    );
+
+    await new Promise((r) => setTimeout(r, 120)); // well past total (30ms), AFTER settle
+    expect(stopped).toBe(true);                    // total fired despite stream settled
+    expect(sendMessage).toHaveBeenCalledTimes(1);  // one total-ceiling apology
+    expect(started).toEqual([1]);                  // 2nd turn still queued (lock held)
+
+    release();
+    await Promise.all([p1, p2]);
+    expect(started).toEqual([1, 2]);               // 2nd runs only after 1st settles
+    expect(sendMessage).toHaveBeenCalledTimes(1);  // no second apology
   });
 });
 
@@ -729,24 +1000,30 @@ describe('doc-task dispatch (2a egress purity + 2b claim lifecycle)', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  it('2b: a normal (non-doc) hung turn still times out and releases the lock', async () => {
-    // Control: the timeout binding is doc-task-specific; ordinary turns keep the
-    // #141 behavior (release the lock, apologize) so one hung turn can't wedge a
-    // session forever.
+  it('2b: a normal (non-doc) stalled turn still surfaces the apology (doc guard is not global)', async () => {
+    // Control: the doc-task force-await binding is doc-specific; an ordinary turn
+    // still gets the #141 dispatch NOTICE on a stall (proving the doc-only guard
+    // didn't disable the watchdog globally). Post-#21-review the notice keeps the
+    // lock rather than releasing it — but it still fires for a normal turn.
     const router = new SessionRouter(
-      makeConfig({ rateLimit: { maxPerMinute: 100 }, dispatchTimeoutMs: 20 }),
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 20, dispatchTimeoutMs: 10_000 }),
       DOC_BOT,
     );
-    await router.routeAndHandle(
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
+
+    const p = router.routeAndHandle(
       makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
-      () => new Promise<void>(() => { /* never resolves */ }),
+      () => hang,
     );
-    // A normal message DOES get the bounded apology (proving the doc-only guard
-    // above didn't disable the timeout globally).
+    await new Promise((r) => setTimeout(r, 90));
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(vi.mocked(sendMessage).mock.calls[0][0]).toMatchObject({
       content: expect.stringContaining('处理超时'),
     });
+
+    release();
+    await p;
   });
 });
 

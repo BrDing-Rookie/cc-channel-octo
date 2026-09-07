@@ -421,12 +421,30 @@ export interface Config {
   /** Maximum response length in chars before truncation (Q32). */
   maxResponseChars: number;
   /**
-   * Per-message dispatch timeout in ms (#141). Bounds the full handler
-   * pipeline (agent query + stream) under the per-session lock. If a turn
-   * hangs past this, the session lock is released (a hung turn would otherwise
-   * block every subsequent message on that session forever) and the user gets
-   * a one-shot apology. Does NOT cancel the in-flight turn — only unblocks the
-   * queue. Default 5 minutes.
+   * Idle (liveness) timeout in ms — the PRIMARY dispatch bound (activity
+   * watchdog). A turn is judged stalled only when its SDK stream has been SILENT
+   * (no assistant / thinking / tool_use / tool_result / result event) longer
+   * than this, NOT when total wall-clock exceeds a fixed budget. A healthy but
+   * slow turn (a long multi-tool run that keeps emitting events) is therefore
+   * never flagged, however long it runs. On a stall the user gets a one-shot
+   * apology and any per-turn stop hook fires, but the session lock is HELD (we
+   * never cancel the in-flight turn, so we must never let a follow-up message on
+   * the same session start a concurrent query — it queues behind the lock until
+   * the turn settles). Merged per-bot like the other top-level fields; clamped to
+   * 2**31-1 before use (#121). 0 disables the idle level. Default 2 minutes.
+   */
+  idleTimeoutMs?: number;
+  /**
+   * Total dispatch ceiling in ms (#141) — the handler's HARD upper bound and a
+   * large absolute-time fallback now that {@link idleTimeoutMs} is the primary
+   * bound. Trips once if the handler has not RETURNED by then, independent of
+   * whether the SDK stream has drained — so it bounds not only an
+   * events-never-stop tool loop but also a hung POST-stream settle (final
+   * delivery / history write / card finalize). Like the idle level it is FEEDBACK
+   * ONLY: it surfaces a one-shot apology + stop hook but does NOT release the
+   * session lock (a concurrent turn on the same session must never start while the
+   * first is still running — we do not cancel it). Clamped to 2**31-1 before use
+   * (#121). 0 disables it. Default 30 minutes.
    */
   dispatchTimeoutMs: number;
   botBlocklist?: string[];
@@ -522,6 +540,7 @@ type PartialConfig = {
   rateLimit?: Partial<Config['rateLimit']>;
   context?: Partial<Config['context']>;
   maxResponseChars?: number;
+  idleTimeoutMs?: number;
   dispatchTimeoutMs?: number;
   botBlocklist?: string[];
   allowedBotUids?: string[];
@@ -559,7 +578,8 @@ function defaults(): Config {
       historyLimit: 40,
     },
     maxResponseChars: 524_288, // 512 KB (Q32)
-    dispatchTimeoutMs: 300_000, // 5 min (#141)
+    idleTimeoutMs: 120_000, // 2 min — primary activity-watchdog bound (#141 refit)
+    dispatchTimeoutMs: 1_800_000, // 30 min — large lock-release backstop (#141, demoted)
   };
 }
 
@@ -633,6 +653,7 @@ function mergeConfig(base: Config, override: PartialConfig): Config {
       ...(override.context ?? {}),
     },
     maxResponseChars: override.maxResponseChars ?? base.maxResponseChars,
+    idleTimeoutMs: override.idleTimeoutMs ?? base.idleTimeoutMs,
     dispatchTimeoutMs: override.dispatchTimeoutMs ?? base.dispatchTimeoutMs,
     botBlocklist: override.botBlocklist ?? base.botBlocklist,
     allowedBotUids: override.allowedBotUids ?? base.allowedBotUids,
@@ -864,6 +885,10 @@ export function resolveBotConfigs(config: Config): Config[] {
       mentionFreeGroups:
         perBotFile.mentionFreeGroups ?? bot.mentionFreeGroups ?? config.mentionFreeGroups,
       onBehalfOf: perBotFile.onBehalfOf ?? bot.onBehalfOf ?? config.onBehalfOf,
+      // #141: dispatch bounds honor a per-bot override (else inherit the global
+      // merged value from `...config`), matching the other top-level fields.
+      idleTimeoutMs: perBotFile.idleTimeoutMs ?? config.idleTimeoutMs,
+      dispatchTimeoutMs: perBotFile.dispatchTimeoutMs ?? config.dispatchTimeoutMs,
       groupConfigDir: perBotFile.groupConfigDir ?? config.groupConfigDir,
       serverMd: perBotFile.serverMd ?? config.serverMd,
       serverMdTtlMs: perBotFile.serverMdTtlMs ?? config.serverMdTtlMs,

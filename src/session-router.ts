@@ -51,6 +51,23 @@ export interface RouteResult {
    * in the background (we do not cancel the in-flight turn — see runHandlerWithTimeout).
    */
   onDispatchTimeout?: () => void;
+  /**
+   * Activity beacon for the idle (liveness) watchdog. The handler calls this on
+   * every SDK stream event (assistant / thinking / tool_use / tool_result /
+   * result) — proof the turn is "still running". runHandlerWithTimeout judges a
+   * turn hung only when the beacon has been SILENT longer than `idleTimeoutMs`,
+   * so a healthy-but-slow turn that keeps emitting events is never killed. Set by
+   * the router before the handler runs; a no-op when the timeout is disabled.
+   */
+  notifyActivity?: () => void;
+  /**
+   * Settle signal for the idle watchdog. The handler calls this ONCE when the SDK
+   * stream has fully drained — after which the natural quiet of the turn's own
+   * settle (final result flush, post-stream bookkeeping) must NOT be mistaken for
+   * a stall. It suspends the idle watchdog; only the large total dispatch backstop
+   * guards the settle/post-stream phase. Idempotent; a no-op when disabled.
+   */
+  notifyStreamSettled?: () => void;
 }
 
 interface TokenBucket {
@@ -67,6 +84,20 @@ const GLOBAL_RATE_MULTIPLIER = 10;
 
 /** Maximum allowed content length in bytes (Q10). Messages exceeding this are rejected. */
 const MAX_CONTENT_BYTES = 32_768; // 32 KB
+
+/**
+ * #121: the largest delay `setTimeout` accepts as a signed 32-bit int. Node
+ * silently coerces a larger delay to 1ms (emitting a TimeoutOverflowWarning) —
+ * which would fire the dispatch watchdog on the very next tick and reply
+ * "处理超时" to EVERY message. Any ms value handed to setTimeout is clamped here
+ * first. Mirrors openclaw src/inbound.ts (DISPATCH_TIMEOUT_MAX_MS).
+ */
+const SETTIMEOUT_MAX_MS = 2_147_483_647; // 2**31 - 1 (~24.8 days)
+
+/** Clamp a would-be setTimeout delay to the 32-bit ceiling (#121). */
+function clampTimeoutMs(ms: number): number {
+  return ms > SETTIMEOUT_MAX_MS ? SETTIMEOUT_MAX_MS : ms;
+}
 
 export class SessionRouter {
   private readonly config: Config;
@@ -214,96 +245,162 @@ export class SessionRouter {
   }
 
   /**
-   * #141: Run the handler under a dispatch timeout so a hung turn (a stuck SDK
-   * query, a wedged tool subprocess, a stalled stream) cannot block the session
-   * forever. The handler runs inside withSessionLock — if it never returns, the
-   * lock's gate never resolves and EVERY subsequent message for this session is
-   * stuck permanently (silent). Racing the handler against a timeout guarantees
-   * the lock releases.
+   * #141 (refit to an activity watchdog): run the handler under a dispatch bound
+   * that surfaces feedback on a stall WITHOUT ever releasing the session lock —
+   * so a healthy-but-slow turn is never killed AND a follow-up message can never
+   * start a concurrent turn against a still-running one.
    *
-   * Scope (mirrors openclaw #75): we do NOT cancel the in-flight turn — the SDK
-   * query keeps running to completion in the background; we only unblock the
-   * queue. Worst case is a delayed real reply arriving after the apology.
+   * We never cancel the in-flight turn (no AbortSignal into the SDK query), so we
+   * must never let a second turn start while the first is still running: a second
+   * `query()` would `resume` the SAME SDK session id + auto-memory dir + cwd and
+   * double-write. The session lock is therefore held for the WHOLE handler — a
+   * dispatch timeout only surfaces a user-facing notice; it does NOT unblock the
+   * queue. A follow-up same-session message stays queued behind the lock and runs
+   * (its query starts) only after the in-flight turn truly settles. This is the
+   * hard concurrency guarantee (PR #21 review: reviewer + architect) — it
+   * generalizes the doc-task force-await to normal turns.
    *
-   * `timeoutError` is a per-invocation Error so the catch identifies OUR timeout
-   * by reference equality, never by string comparison (a same-text upstream
-   * error must not be misclassified).
+   * Two feedback levels (both keep the lock; the apology + `onDispatchTimeout`
+   * hook fire at most ONCE, whichever trips first):
+   *  1. **idle (primary)** — `idleTimeoutMs`. Trips when the SDK stream has been
+   *     SILENT (no assistant/thinking/tool/result event, via `result.notifyActivity`)
+   *     longer than this. A turn that keeps emitting events — however long it runs
+   *     — refreshes the beacon and never trips it. Re-arms for the remaining window
+   *     on a false alarm; suspended once the stream drains (`notifyStreamSettled`)
+   *     so the turn's own settle window (final flush + bookkeeping) is not misread
+   *     as a stall.
+   *  2. **total** — `dispatchTimeoutMs`, a large absolute ceiling and the
+   *     handler's HARD upper bound. Trips once if the handler has not RETURNED by
+   *     then — independent of whether the stream has drained, so it bounds not
+   *     just an events-never-stop tool loop but also a hung POST-stream settle
+   *     (delivery / history write / card finalize). Feedback only — like idle, it
+   *     keeps the lock. Stays armed through the settle window; cleared only when
+   *     the handler actually settles (`finally`).
+   *
+   * Both ms values are clamped to 2**31-1 (#121) before setTimeout so a large
+   * config can't overflow to 1ms and fire on the next tick.
    */
   private async runHandlerWithTimeout(
     result: RouteResult,
     handler: (result: RouteResult) => Promise<void>,
   ): Promise<void> {
-    const timeoutMs = this.config.dispatchTimeoutMs;
-    if (!timeoutMs || timeoutMs <= 0) {
-      // Timeout disabled — run unguarded.
+    const idleMs = clampTimeoutMs(this.config.idleTimeoutMs ?? 0);
+    const totalMs = clampTimeoutMs(this.config.dispatchTimeoutMs ?? 0);
+
+    if (idleMs <= 0 && totalMs <= 0) {
+      // Both levels disabled — run unguarded (still awaited to completion).
       await handler(result);
       return;
     }
 
-    // Severe fix 2b: a genuine doc task must bind its claim-release / event-ack /
-    // fallback-notice lifecycle to the REAL turn settle, never to the dispatch
-    // timeout. The doc-mention handler treats "dispatch resolved" as "the turn
-    // (incl. the final doc POST) is done" — its documented contract. If the
-    // timeout let dispatch resolve while the turn kept running in the background,
-    // the handler would see an EMPTY report and prematurely release the dedupe
-    // claim, ack the event, and post a "no reply" fallback — after which the
-    // still-running turn completes its non-idempotent document edit, and any
-    // redelivery (dedupe now released) could run a SECOND concurrent edit. So for
-    // a doc task we await the handler to true completion. The session-lock
-    // early-release the timeout buys is a no-op here anyway: the event poller
-    // processes doc mentions strictly serially, so nothing else is waiting on this
-    // lock. index.ts's handler is fully self-contained (never throws for a doc
-    // task), matching the timeout-disabled branch above.
+    // Severe fix 2b (unchanged): a genuine doc task binds its claim-release /
+    // event-ack / fallback-notice lifecycle to the REAL turn settle, never to a
+    // dispatch timeout — the doc-mention handler treats "dispatch resolved" as
+    // "the turn (incl. the final doc POST) is done". It also must never synthesize
+    // an IM apology (its channel is a non-routable sentinel). So a doc task runs
+    // with NO feedback timers at all: await to true completion, no apology.
     if (isAuthenticDocFire(result.message.payload)) {
       await handler(result);
       return;
     }
 
-    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-    const timeoutError = new Error(`dispatch timed out after ${timeoutMs}ms`);
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(() => reject(timeoutError), timeoutMs);
-    });
+    let lastEventAt = Date.now();
+    let streamSettled = false;
+    let surfaced = false;
+    let idleHandle: ReturnType<typeof setTimeout> | undefined;
+    let totalHandle: ReturnType<typeof setTimeout> | undefined;
 
-    // The handler keeps running after a timeout (we don't cancel the in-flight
-    // turn — see scope note above). Once the race settles on timeoutError, that
-    // orphaned promise is no longer awaited; attach a no-op catch so a late
-    // rejection from a handler that doesn't self-contain its errors can't surface
-    // as an unhandledRejection. Today's caller (index.ts) is fully try/caught, so
-    // this is defense-in-depth for future callers.
-    const handlerPromise = handler(result);
-    handlerPromise.catch(() => { /* swallow late rejection after timeout */ });
+    const clearIdleTimer = (): void => {
+      if (idleHandle) {
+        clearTimeout(idleHandle);
+        idleHandle = undefined;
+      }
+    };
+    const clearAllTimers = (): void => {
+      clearIdleTimer();
+      if (totalHandle) {
+        clearTimeout(totalHandle);
+        totalHandle = undefined;
+      }
+    };
+
+    // Activity beacon + settle signal handed to the handler (index.ts wires them
+    // into the SDK stream). Assigned BEFORE the handler runs so the first event
+    // already refreshes the beacon.
+    result.notifyActivity = () => {
+      lastEventAt = Date.now();
+    };
+    result.notifyStreamSettled = () => {
+      // Stream fully drained → the turn is settling. Suspend ONLY the idle
+      // watchdog: the naturally-quiet settle window (final flush / history write /
+      // card finalize) must not read as a stall. The TOTAL ceiling stays armed
+      // until the handler truly returns (cleared in `finally`) — post-stream work
+      // is still "the handler not settled", so a hung settle must remain bounded
+      // by the absolute ceiling (PR #21 review: total = handler's hard upper
+      // bound, independent of when the stream drains). The lock is held until the
+      // handler resolves either way, so the concurrency guarantee is unchanged.
+      streamSettled = true;
+      clearIdleTimer();
+    };
+
+    // Surface the timeout NOTICE at most ONCE (idle first, else total). This never
+    // releases the lock — it only tells the user the turn is taking too long and
+    // lets the handler settle per-turn state (progress card → stopped). The apology
+    // is fire-and-forget; replySafe swallows its own errors and the underlying
+    // sendMessage is time-bounded, so a sick Octo API can't re-hang us here.
+    const surfaceTimeout = (level: 'idle' | 'total'): void => {
+      if (surfaced) return;
+      surfaced = true;
+      try {
+        result.onDispatchTimeout?.();
+      } catch (hookErr) {
+        console.error(
+          `session-router: onDispatchTimeout hook threw (session=${result.sessionKey}): ${String(hookErr)}`,
+        );
+      }
+      console.warn(
+        `session-router: dispatch ${level} timeout — notifying user, lock held until the turn settles ` +
+          `(session=${result.sessionKey})`,
+      );
+      void this.replySafe(result.message, '⚠️ 处理超时，请稍后重试。');
+    };
+
+    // Idle watchdog: re-arms for the REMAINING window on a false alarm (an event
+    // arrived after the timer was scheduled). Suspended once the stream settles.
+    const onIdleCheck = (): void => {
+      if (streamSettled) return;
+      const since = Date.now() - lastEventAt;
+      if (since >= idleMs) {
+        surfaceTimeout('idle');
+        return;
+      }
+      idleHandle = setTimeout(onIdleCheck, clampTimeoutMs(idleMs - since));
+    };
+    if (idleMs > 0) idleHandle = setTimeout(onIdleCheck, idleMs);
+
+    // Total ceiling: the handler's HARD upper bound. Fires once if the handler has
+    // not returned by then — regardless of whether the stream has drained, so a
+    // hung post-stream settle (delivery / history write / card finalize) is bounded
+    // too. Cleared in `finally` when the handler actually settles.
+    if (totalMs > 0) {
+      totalHandle = setTimeout(() => surfaceTimeout('total'), totalMs);
+    }
 
     try {
-      await Promise.race([handlerPromise, timeoutPromise]);
+      // ALWAYS await the handler to true completion — NEVER release the lock early.
+      // The feedback timers above only surface an apology; the in-flight turn keeps
+      // running under the lock, so a follow-up same-session message queues and can
+      // never start a concurrent query() (we do not cancel the turn).
+      await handler(result);
     } catch (err) {
-      if (err === timeoutError) {
-        // A6/#141: let the handler settle per-turn state (progress card → stopped)
-        // before we apologize. Best-effort; a throwing hook must not wedge the queue.
-        try {
-          result.onDispatchTimeout?.();
-        } catch (hookErr) {
-          console.error(
-            `session-router: onDispatchTimeout hook threw (session=${result.sessionKey}): ${String(hookErr)}`,
-          );
-        }
-        console.warn(
-          `session-router: dispatch hung past ${timeoutMs}ms, releasing session lock (session=${result.sessionKey})`,
-        );
-        // Bounded apology — replySafe swallows its own errors, and the
-        // underlying sendMessage in octo/api.ts is itself time-bounded, so a
-        // sick Octo API can't re-hang us here.
-        await this.replySafe(result.message, '⚠️ 处理超时，请稍后重试。');
-        return; // swallow: the lock releases, the queue advances
-      }
       // A real handler error — index.ts's handler already catches and replies
-      // internally, so reaching here is unexpected. Swallow to keep the lock
-      // release path identical (never let an error wedge the queue).
+      // internally, so reaching here is unexpected. Swallow so an error can't
+      // wedge the queue any differently than a normal return.
       console.error(
         `session-router: handler error (session=${result.sessionKey}): ${String(err)}`,
       );
     } finally {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
+      clearAllTimers();
     }
   }
 
