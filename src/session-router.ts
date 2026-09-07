@@ -245,36 +245,37 @@ export class SessionRouter {
   }
 
   /**
-   * #141 (refit to an activity watchdog): run the handler under a TWO-LEVEL
-   * dispatch bound so a hung turn cannot block the session forever, while a
-   * healthy-but-slow turn is never killed.
+   * #141 (refit to an activity watchdog): run the handler under a dispatch bound
+   * that surfaces feedback on a stall WITHOUT ever releasing the session lock —
+   * so a healthy-but-slow turn is never killed AND a follow-up message can never
+   * start a concurrent turn against a still-running one.
    *
-   *  1. **idle (primary)** — `idleTimeoutMs`. Judged hung only when the SDK stream
-   *     has been SILENT (no assistant/thinking/tool/result event, via
-   *     `result.notifyActivity`) longer than this. A turn that keeps emitting
-   *     events — however long it runs — refreshes the beacon and never trips it.
-   *     On an idle stall we surface feedback (apology + the per-turn
-   *     `onDispatchTimeout` hook) but KEEP the session lock: the in-flight turn
-   *     keeps running under it, so a follow-up message on the same session cannot
-   *     start a CONCURRENT `query()` (same SDK session id + memory dir + cwd) — it
-   *     queues behind the lock instead. This is the concurrency guarantee (the
-   *     doc-task path already force-awaits; this generalizes it to normal turns).
+   * We never cancel the in-flight turn (no AbortSignal into the SDK query), so we
+   * must never let a second turn start while the first is still running: a second
+   * `query()` would `resume` the SAME SDK session id + auto-memory dir + cwd and
+   * double-write. The session lock is therefore held for the WHOLE handler — a
+   * dispatch timeout only surfaces a user-facing notice; it does NOT unblock the
+   * queue. A follow-up same-session message stays queued behind the lock and runs
+   * (its query starts) only after the in-flight turn truly settles. This is the
+   * hard concurrency guarantee (PR #21 review: reviewer + architect) — it
+   * generalizes the doc-task force-await to normal turns.
    *
-   *  2. **total (backstop)** — `dispatchTimeoutMs`, intentionally large. The ONLY
-   *     level that RELEASES the lock, for the pathological case where events never
-   *     stop AND the turn never settles (a tool loop), or a turn still wedged well
-   *     past the idle notice. Mirrors openclaw #75: we do NOT cancel the in-flight
-   *     turn — the SDK query runs to completion in the background; we only unblock
-   *     the queue. Worst case is a delayed real reply arriving after the apology.
-   *
-   * The idle watchdog is SUSPENDED once the stream drains (`notifyStreamSettled`):
-   * the turn's own settle window (final flush + bookkeeping) is naturally quiet and
-   * must not read as a stall — only the total backstop guards that phase.
+   * Two feedback levels (both keep the lock; the apology + `onDispatchTimeout`
+   * hook fire at most ONCE, whichever trips first):
+   *  1. **idle (primary)** — `idleTimeoutMs`. Trips when the SDK stream has been
+   *     SILENT (no assistant/thinking/tool/result event, via `result.notifyActivity`)
+   *     longer than this. A turn that keeps emitting events — however long it runs
+   *     — refreshes the beacon and never trips it. Re-arms for the remaining window
+   *     on a false alarm; suspended once the stream drains (`notifyStreamSettled`)
+   *     so the turn's own settle window (final flush + bookkeeping) is not misread
+   *     as a stall.
+   *  2. **total** — `dispatchTimeoutMs`, a large absolute ceiling. Trips when the
+   *     turn is STILL not settled by then (a pathological events-never-stop tool
+   *     loop, or a turn wedged past the idle notice). Feedback only — like idle, it
+   *     keeps the lock. Kept mainly so an idle-disabled config still gets one notice.
    *
    * Both ms values are clamped to 2**31-1 (#121) before setTimeout so a large
-   * config can't overflow to 1ms and fire on the next tick. `timeoutError` is a
-   * per-invocation Error so the catch identifies OUR backstop by reference, never
-   * by string comparison.
+   * config can't overflow to 1ms and fire on the next tick.
    */
   private async runHandlerWithTimeout(
     result: RouteResult,
@@ -284,22 +285,17 @@ export class SessionRouter {
     const totalMs = clampTimeoutMs(this.config.dispatchTimeoutMs ?? 0);
 
     if (idleMs <= 0 && totalMs <= 0) {
-      // Both levels disabled — run unguarded.
+      // Both levels disabled — run unguarded (still awaited to completion).
       await handler(result);
       return;
     }
 
-    // Severe fix 2b (unchanged): a genuine doc task must bind its claim-release /
+    // Severe fix 2b (unchanged): a genuine doc task binds its claim-release /
     // event-ack / fallback-notice lifecycle to the REAL turn settle, never to a
-    // dispatch timeout. The doc-mention handler treats "dispatch resolved" as "the
-    // turn (incl. the final doc POST) is done" — its documented contract. If a
-    // timeout let dispatch resolve while the turn kept running, the handler would
-    // see an EMPTY report and prematurely release the dedupe claim, ack the event,
-    // and post a "no reply" fallback — after which the still-running turn completes
-    // its non-idempotent document edit, and any redelivery could run a SECOND
-    // concurrent edit. So for a doc task we await the handler to true completion.
-    // The lock early-release the backstop buys is a no-op here anyway: doc mentions
-    // are processed strictly serially, so nothing else is waiting on this lock.
+    // dispatch timeout — the doc-mention handler treats "dispatch resolved" as
+    // "the turn (incl. the final doc POST) is done". It also must never synthesize
+    // an IM apology (its channel is a non-routable sentinel). So a doc task runs
+    // with NO feedback timers at all: await to true completion, no apology.
     if (isAuthenticDocFire(result.message.payload)) {
       await handler(result);
       return;
@@ -311,6 +307,17 @@ export class SessionRouter {
     let idleHandle: ReturnType<typeof setTimeout> | undefined;
     let totalHandle: ReturnType<typeof setTimeout> | undefined;
 
+    const clearTimers = (): void => {
+      if (idleHandle) {
+        clearTimeout(idleHandle);
+        idleHandle = undefined;
+      }
+      if (totalHandle) {
+        clearTimeout(totalHandle);
+        totalHandle = undefined;
+      }
+    };
+
     // Activity beacon + settle signal handed to the handler (index.ts wires them
     // into the SDK stream). Assigned BEFORE the handler runs so the first event
     // already refreshes the beacon.
@@ -318,18 +325,22 @@ export class SessionRouter {
       lastEventAt = Date.now();
     };
     result.notifyStreamSettled = () => {
+      // Stream fully drained → the turn is settling. Stop the stall watchdogs so
+      // the naturally-quiet settle window (final flush / history write / card
+      // finalize) is never flagged; the lock is still held until the handler
+      // resolves, so this changes nothing about the concurrency guarantee.
       streamSettled = true;
+      clearTimers();
     };
 
-    // Surface the timeout notice at most ONCE (idle first, else total). The apology
-    // is fire-and-forget so the idle notice never blocks the still-running turn;
-    // replySafe swallows its own errors and the underlying sendMessage is
-    // time-bounded, so a sick Octo API can't re-hang us here.
+    // Surface the timeout NOTICE at most ONCE (idle first, else total). This never
+    // releases the lock — it only tells the user the turn is taking too long and
+    // lets the handler settle per-turn state (progress card → stopped). The apology
+    // is fire-and-forget; replySafe swallows its own errors and the underlying
+    // sendMessage is time-bounded, so a sick Octo API can't re-hang us here.
     const surfaceTimeout = (level: 'idle' | 'total'): void => {
       if (surfaced) return;
       surfaced = true;
-      // Let the handler settle per-turn state (progress card → stopped) before we
-      // apologize. Best-effort; a throwing hook must not wedge the queue.
       try {
         result.onDispatchTimeout?.();
       } catch (hookErr) {
@@ -338,9 +349,8 @@ export class SessionRouter {
         );
       }
       console.warn(
-        `session-router: dispatch ${
-          level === 'idle' ? `idle past ${idleMs}ms` : `hung past ${totalMs}ms, releasing session lock`
-        } (session=${result.sessionKey})`,
+        `session-router: dispatch ${level} timeout — notifying user, lock held until the turn settles ` +
+          `(session=${result.sessionKey})`,
       );
       void this.replySafe(result.message, '⚠️ 处理超时，请稍后重试。');
     };
@@ -348,11 +358,9 @@ export class SessionRouter {
     // Idle watchdog: re-arms for the REMAINING window on a false alarm (an event
     // arrived after the timer was scheduled). Suspended once the stream settles.
     const onIdleCheck = (): void => {
-      if (streamSettled) return; // settle window — only the total backstop guards it
+      if (streamSettled) return;
       const since = Date.now() - lastEventAt;
       if (since >= idleMs) {
-        // Idle stall: surface feedback but DO NOT release the lock — the total
-        // backstop is the only path that unblocks the queue (concurrency guarantee).
         surfaceTimeout('idle');
         return;
       }
@@ -360,37 +368,28 @@ export class SessionRouter {
     };
     if (idleMs > 0) idleHandle = setTimeout(onIdleCheck, idleMs);
 
-    const timeoutError = new Error(`dispatch timed out after ${totalMs}ms`);
-    const totalPromise = new Promise<never>((_, reject) => {
-      if (totalMs > 0) totalHandle = setTimeout(() => reject(timeoutError), totalMs);
-    });
-
-    // The handler keeps running after a timeout (we never cancel the in-flight
-    // turn). Attach a no-op catch so a late rejection can't surface as an
-    // unhandledRejection once the race has settled on timeoutError.
-    const handlerPromise = handler(result);
-    handlerPromise.catch(() => {
-      /* swallow late rejection after timeout */
-    });
+    // Total ceiling: a one-shot notice if the turn is still unsettled by then.
+    if (totalMs > 0) {
+      totalHandle = setTimeout(() => {
+        if (!streamSettled) surfaceTimeout('total');
+      }, totalMs);
+    }
 
     try {
-      await Promise.race([handlerPromise, totalPromise]);
+      // ALWAYS await the handler to true completion — NEVER release the lock early.
+      // The feedback timers above only surface an apology; the in-flight turn keeps
+      // running under the lock, so a follow-up same-session message queues and can
+      // never start a concurrent query() (we do not cancel the turn).
+      await handler(result);
     } catch (err) {
-      if (err === timeoutError) {
-        // Total backstop tripped: surface (if the idle notice didn't already) and
-        // return — releasing the session lock. Rare last resort; see header.
-        surfaceTimeout('total');
-        return;
-      }
       // A real handler error — index.ts's handler already catches and replies
-      // internally, so reaching here is unexpected. Swallow to keep the lock
-      // release path identical (never let an error wedge the queue).
+      // internally, so reaching here is unexpected. Swallow so an error can't
+      // wedge the queue any differently than a normal return.
       console.error(
         `session-router: handler error (session=${result.sessionKey}): ${String(err)}`,
       );
     } finally {
-      if (idleHandle) clearTimeout(idleHandle);
-      if (totalHandle) clearTimeout(totalHandle);
+      clearTimers();
     }
   }
 

@@ -413,27 +413,28 @@ export interface Config {
   maxResponseChars: number;
   /**
    * Idle (liveness) timeout in ms — the PRIMARY dispatch bound (activity
-   * watchdog). A turn is judged hung only when its SDK stream has been SILENT
+   * watchdog). A turn is judged stalled only when its SDK stream has been SILENT
    * (no assistant / thinking / tool_use / tool_result / result event) longer
    * than this, NOT when total wall-clock exceeds a fixed budget. A healthy but
    * slow turn (a long multi-tool run that keeps emitting events) is therefore
-   * never killed, however long it runs. On an idle stall the user gets a
-   * one-shot apology and any per-turn stop hook fires, but the session lock is
-   * KEPT (the in-flight turn keeps running under it, so a follow-up message on
-   * the same session cannot start a concurrent query — it queues). Merged
-   * per-bot like the other top-level fields; clamped to 2**31-1 before use
-   * (#121). 0 disables the idle level. Default 2 minutes.
+   * never flagged, however long it runs. On a stall the user gets a one-shot
+   * apology and any per-turn stop hook fires, but the session lock is HELD (we
+   * never cancel the in-flight turn, so we must never let a follow-up message on
+   * the same session start a concurrent query — it queues behind the lock until
+   * the turn settles). Merged per-bot like the other top-level fields; clamped to
+   * 2**31-1 before use (#121). 0 disables the idle level. Default 2 minutes.
    */
   idleTimeoutMs?: number;
   /**
-   * Total dispatch backstop in ms (#141), semantically DEMOTED to a large final
-   * ceiling now that {@link idleTimeoutMs} is the primary bound. It guards the
-   * pathological case where events never stop AND the turn never settles (e.g. a
-   * tool loop), or a turn still wedged after the idle notice. This is the ONLY
-   * level that RELEASES the session lock (a hung turn would otherwise block every
-   * subsequent message on that session forever), so it is intentionally large.
-   * Does NOT cancel the in-flight turn — only unblocks the queue. Clamped to
-   * 2**31-1 before use (#121). 0 disables the backstop. Default 30 minutes.
+   * Total dispatch ceiling in ms (#141), a large absolute-time fallback now that
+   * {@link idleTimeoutMs} is the primary bound. Trips only if the turn is STILL
+   * unsettled by then (a pathological events-never-stop tool loop, or a turn
+   * wedged past the idle notice). Like the idle level it is FEEDBACK ONLY: it
+   * surfaces a one-shot apology + stop hook but does NOT release the session lock
+   * (a concurrent turn on the same session must never start while the first is
+   * still running — we do not cancel it). Kept mainly so an idle-disabled config
+   * still gets one notice. Clamped to 2**31-1 before use (#121). 0 disables it.
+   * Default 30 minutes.
    */
   dispatchTimeoutMs: number;
   botBlocklist?: string[];
