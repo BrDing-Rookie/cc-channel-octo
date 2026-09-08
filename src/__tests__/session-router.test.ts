@@ -1052,7 +1052,7 @@ describe('LOO-18 dispatch follow-up (copy grading / heartbeat / settle log)', ()
   // (d) the settle log fires on BOTH paths — a turn that surfaced a notice and a
   // turn that finished cleanly — so ops can tell "slow-but-recovered" from
   // "healthy" after the fact. It records which level (if any) surfaced.
-  it('(d) logs a settle line on both the surfaced and the clean path', async () => {
+  it('(d) logs a settle line on the clean, idle-surfaced, and total-surfaced paths', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       const router = new SessionRouter(
@@ -1077,14 +1077,32 @@ describe('LOO-18 dispatch follow-up (copy grading / heartbeat / settle log)', ()
       release();
       await p;
 
+      // Total-surfaced path: idle DISABLED + short total, so the ONLY trip is the
+      // total ceiling. Release the handler after total fires; the settle log must
+      // record surfaced=total (reviewer follow-up: none/idle weren't enough).
+      const totalRouter = new SessionRouter(
+        makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 0, dispatchTimeoutMs: 20 }),
+        ROBOT_ID,
+      );
+      let releaseTotal!: () => void;
+      const totalHang = new Promise<void>((r) => { releaseTotal = r; });
+      const pTotal = totalRouter.routeAndHandle(
+        makeMsg({ message_id: '3', channel_type: ChannelType.DM, from_uid: 'u_total' }),
+        () => totalHang,
+      );
+      await new Promise((r) => setTimeout(r, 60)); // past total (20ms) → surfaces
+      releaseTotal();
+      await pTotal;
+
       const settleLogs = logSpy.mock.calls
         .map((c) => String(c[0]))
         .filter((l) => l.includes('turn settled'));
-      // One settle line per turn.
-      expect(settleLogs.length).toBe(2);
-      // Clean turn: surfaced=none. Slow turn: surfaced=idle.
+      // One settle line per turn (3 turns).
+      expect(settleLogs.length).toBe(3);
+      // Every level is represented and directly asserted.
       expect(settleLogs.some((l) => l.includes('surfaced=none'))).toBe(true);
       expect(settleLogs.some((l) => l.includes('surfaced=idle'))).toBe(true);
+      expect(settleLogs.some((l) => l.includes('surfaced=total'))).toBe(true);
       // Elapsed is recorded on every line.
       expect(settleLogs.every((l) => /elapsedMs=\d+/.test(l))).toBe(true);
     } finally {
