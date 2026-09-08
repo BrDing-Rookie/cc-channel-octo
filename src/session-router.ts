@@ -304,9 +304,14 @@ export class SessionRouter {
       return;
     }
 
-    let lastEventAt = Date.now();
+    const startedAt = Date.now();
+    let lastEventAt = startedAt;
     let streamSettled = false;
     let surfaced = false;
+    // Item 4 (settle log): which level (if any) surfaced a notice for this turn.
+    // Read in the `finally` settle log to distinguish "finished slow" (never
+    // surfaced) from "surfaced idle/total then eventually settled".
+    let surfacedLevel: 'idle' | 'total' | null = null;
     let idleHandle: ReturnType<typeof setTimeout> | undefined;
     let totalHandle: ReturnType<typeof setTimeout> | undefined;
 
@@ -348,9 +353,21 @@ export class SessionRouter {
     // lets the handler settle per-turn state (progress card → stopped). The apology
     // is fire-and-forget; replySafe swallows its own errors and the underlying
     // sendMessage is time-bounded, so a sick Octo API can't re-hang us here.
+    //
+    // The two levels carry DIFFERENT copy on purpose (LOO-18 item 1). Under the
+    // activity-watchdog design a timeout does NOT kill the turn — the lock is held
+    // and the turn keeps running to completion:
+    //  - idle: the turn is still alive (its SDK stream just went quiet for a while);
+    //    it will keep producing a result. Telling the user to "retry" is WRONG — a
+    //    retry only queues behind the still-running turn. So the idle copy reassures
+    //    ("still working, hang on") and does NOT offer a retry.
+    //  - total: the 30-min hard ceiling — the one case where the turn may genuinely
+    //    be wedged. Here abandoning / retrying later is a reasonable suggestion, so
+    //    the copy says so.
     const surfaceTimeout = (level: 'idle' | 'total'): void => {
       if (surfaced) return;
       surfaced = true;
+      surfacedLevel = level;
       try {
         result.onDispatchTimeout?.();
       } catch (hookErr) {
@@ -362,7 +379,11 @@ export class SessionRouter {
         `session-router: dispatch ${level} timeout — notifying user, lock held until the turn settles ` +
           `(session=${result.sessionKey})`,
       );
-      void this.replySafe(result.message, '⚠️ 处理超时，请稍后重试。');
+      const notice =
+        level === 'idle'
+          ? '⏳ 仍在处理中，这条消息耗时较长，请稍候，稍后会继续返回结果…'
+          : '⚠️ 处理时间过长，可能已经卡住。如果长时间没有回复，请稍后重新发起。';
+      void this.replySafe(result.message, notice);
     };
 
     // Idle watchdog: re-arms for the REMAINING window on a false alarm (an event
@@ -401,6 +422,17 @@ export class SessionRouter {
       );
     } finally {
       clearAllTimers();
+      // LOO-18 item 4: turn settle log. Idle triggers leave no other trace, so
+      // without this a turn that surfaced an idle notice is indistinguishable
+      // after the fact from one that finished cleanly — and "finished slow" from
+      // "was truly wedged" from "settled normally". Log once at the REAL settle
+      // (handler returned/threw) with: session, wall-clock elapsed, and whether a
+      // timeout was surfaced (and which level). Ops reads `surfaced=none` = healthy,
+      // `surfaced=idle` = slow-but-recovered, `surfaced=total` = hit the hard ceiling.
+      console.log(
+        `session-router: turn settled (session=${result.sessionKey}, ` +
+          `elapsedMs=${Date.now() - startedAt}, surfaced=${surfacedLevel ?? 'none'})`,
+      );
     }
   }
 

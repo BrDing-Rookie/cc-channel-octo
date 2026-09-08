@@ -578,7 +578,7 @@ describe('dispatch timeout (#141)', () => {
     await new Promise((r) => setTimeout(r, 120));
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(vi.mocked(sendMessage).mock.calls[0][0]).toMatchObject({
-      content: expect.stringContaining('处理超时'),
+      content: expect.stringContaining('仍在处理中'),
     });
 
     release();
@@ -764,7 +764,7 @@ describe('idle watchdog (#141 activity-based dispatch bound)', () => {
 
     expect(sendMessage).toHaveBeenCalledTimes(1); // one idle apology
     expect(vi.mocked(sendMessage).mock.calls[0][0]).toMatchObject({
-      content: expect.stringContaining('处理超时'),
+      content: expect.stringContaining('仍在处理中'),
     });
     expect(log).toContain('stop-hook'); // onDispatchTimeout fired at the idle notice
     expect(log).not.toContain('msg2-ran'); // lock held → message 2 still queued
@@ -930,6 +930,187 @@ describe('idle watchdog (#141 activity-based dispatch bound)', () => {
   });
 });
 
+// ─── LOO-18: copy grading + liveness heartbeat + settle log ─────────────────
+
+describe('LOO-18 dispatch follow-up (copy grading / heartbeat / settle log)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // (a) idle vs total copy are DISTINCT and semantically correct: the idle notice
+  // reassures without offering a retry (the turn is still alive and will keep
+  // producing a result — a retry only queues behind it); the total notice, the
+  // 30-min hard ceiling, is the one case where retrying later is reasonable.
+  it('(a) idle and total notices carry distinct, semantically-correct copy', async () => {
+    // idle path: small idle, large total → idle trips first.
+    const idleRouter = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 20, dispatchTimeoutMs: 10_000 }),
+      ROBOT_ID,
+    );
+    let releaseIdle!: () => void;
+    const idleHang = new Promise<void>((r) => { releaseIdle = r; });
+    const pIdle = idleRouter.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u_idle' }),
+      () => idleHang,
+    );
+    await new Promise((r) => setTimeout(r, 80));
+    const idleContent = String(vi.mocked(sendMessage).mock.calls[0][0].content);
+    releaseIdle();
+    await pIdle;
+
+    vi.clearAllMocks();
+
+    // total path: idle disabled, small total → only the total ceiling trips.
+    const totalRouter = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 0, dispatchTimeoutMs: 20 }),
+      ROBOT_ID,
+    );
+    let releaseTotal!: () => void;
+    const totalHang = new Promise<void>((r) => { releaseTotal = r; });
+    const pTotal = totalRouter.routeAndHandle(
+      makeMsg({ message_id: '2', channel_type: ChannelType.DM, from_uid: 'u_total' }),
+      () => totalHang,
+    );
+    await new Promise((r) => setTimeout(r, 80));
+    const totalContent = String(vi.mocked(sendMessage).mock.calls[0][0].content);
+    releaseTotal();
+    await pTotal;
+
+    // Distinct copy.
+    expect(idleContent).not.toBe(totalContent);
+    // idle: reassures, never tells the user to retry (turn is still running).
+    expect(idleContent).toContain('仍在处理中');
+    expect(idleContent).not.toMatch(/重试|重新/);
+    // total: the hard-ceiling case — retrying later is a reasonable suggestion.
+    expect(totalContent).toMatch(/重试|重新/);
+  });
+
+  // (b) a healthy-but-slow turn whose ONLY traffic is the liveness heartbeat
+  // (periodic notifyActivity, no other events) is never misjudged idle, even
+  // though total wall-clock far exceeds the idle window — the beacon refresh
+  // keeps lastEventAt fresh. Mirrors the agent-bridge heartbeat that fires while a
+  // tool is in-flight.
+  it('(b) a periodic liveness heartbeat refreshes lastEventAt and prevents a false idle notice', async () => {
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 40, dispatchTimeoutMs: 10_000 }),
+      ROBOT_ID,
+    );
+    let finished = false;
+    await router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      async (result) => {
+        // ~150ms total, each quiet gap (25ms) < idle (40ms): a fixed wall-clock
+        // timer would have fired; the activity beacon must not.
+        for (let i = 0; i < 6; i++) {
+          result.notifyActivity?.(); // heartbeat only — no stream event
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        result.notifyStreamSettled?.();
+        finished = true;
+      },
+    );
+    expect(finished).toBe(true);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  // (c) the CRITICAL guarantee: a continuous heartbeat must NOT degrade into
+  // "never times out". A turn that keeps beating forever (e.g. a tool subprocess
+  // that hangs — the heartbeat criterion stays TRUE the whole time, so idle is
+  // never tripped) is STILL bounded by the total ceiling, which is independent of
+  // activity. This proves the heartbeat only ever touches the idle beacon.
+  it('(c) a forever-beating (wedged-tool) turn still trips the total backstop', async () => {
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 40, dispatchTimeoutMs: 100 }),
+      ROBOT_ID,
+    );
+    let stopHook = false;
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
+    let beat: ReturnType<typeof setInterval> | undefined;
+
+    const p = router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      (result) => {
+        result.onDispatchTimeout = () => { stopHook = true; };
+        // Beat every 10ms — well under idle (40ms) — so idle NEVER trips.
+        beat = setInterval(() => result.notifyActivity?.(), 10);
+        return hang;
+      },
+    );
+
+    await new Promise((r) => setTimeout(r, 200)); // past total (100ms)
+    expect(stopHook).toBe(true);                  // total fired despite continuous beats
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(String(vi.mocked(sendMessage).mock.calls[0][0].content)).toMatch(/重试|重新/); // total copy
+
+    if (beat) clearInterval(beat);
+    release();
+    await p;
+    expect(sendMessage).toHaveBeenCalledTimes(1); // still exactly one notice
+  });
+
+  // (d) the settle log fires on BOTH paths — a turn that surfaced a notice and a
+  // turn that finished cleanly — so ops can tell "slow-but-recovered" from
+  // "healthy" after the fact. It records which level (if any) surfaced.
+  it('(d) logs a settle line on the clean, idle-surfaced, and total-surfaced paths', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const router = new SessionRouter(
+        makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 20, dispatchTimeoutMs: 10_000 }),
+        ROBOT_ID,
+      );
+
+      // Clean path: fast handler, never surfaces.
+      await router.routeAndHandle(
+        makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u_clean' }),
+        async () => { /* returns immediately */ },
+      );
+
+      // Surfaced path: idle stall → one idle notice, then settles.
+      let release!: () => void;
+      const hang = new Promise<void>((r) => { release = r; });
+      const p = router.routeAndHandle(
+        makeMsg({ message_id: '2', channel_type: ChannelType.DM, from_uid: 'u_slow' }),
+        () => hang,
+      );
+      await new Promise((r) => setTimeout(r, 60));
+      release();
+      await p;
+
+      // Total-surfaced path: idle DISABLED + short total, so the ONLY trip is the
+      // total ceiling. Release the handler after total fires; the settle log must
+      // record surfaced=total (reviewer follow-up: none/idle weren't enough).
+      const totalRouter = new SessionRouter(
+        makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 0, dispatchTimeoutMs: 20 }),
+        ROBOT_ID,
+      );
+      let releaseTotal!: () => void;
+      const totalHang = new Promise<void>((r) => { releaseTotal = r; });
+      const pTotal = totalRouter.routeAndHandle(
+        makeMsg({ message_id: '3', channel_type: ChannelType.DM, from_uid: 'u_total' }),
+        () => totalHang,
+      );
+      await new Promise((r) => setTimeout(r, 60)); // past total (20ms) → surfaces
+      releaseTotal();
+      await pTotal;
+
+      const settleLogs = logSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.includes('turn settled'));
+      // One settle line per turn (3 turns).
+      expect(settleLogs.length).toBe(3);
+      // Every level is represented and directly asserted.
+      expect(settleLogs.some((l) => l.includes('surfaced=none'))).toBe(true);
+      expect(settleLogs.some((l) => l.includes('surfaced=idle'))).toBe(true);
+      expect(settleLogs.some((l) => l.includes('surfaced=total'))).toBe(true);
+      // Elapsed is recorded on every line.
+      expect(settleLogs.every((l) => /elapsedMs=\d+/.test(l))).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
 // ─── Doc-task egress purity + claim lifecycle (severe fixes 2a / 2b) ─────────
 
 describe('doc-task dispatch (2a egress purity + 2b claim lifecycle)', () => {
@@ -1019,7 +1200,7 @@ describe('doc-task dispatch (2a egress purity + 2b claim lifecycle)', () => {
     await new Promise((r) => setTimeout(r, 90));
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(vi.mocked(sendMessage).mock.calls[0][0]).toMatchObject({
-      content: expect.stringContaining('处理超时'),
+      content: expect.stringContaining('仍在处理中'),
     });
 
     release();

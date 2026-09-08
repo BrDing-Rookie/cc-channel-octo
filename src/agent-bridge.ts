@@ -274,6 +274,30 @@ export function buildSystemPrompt(
 const MAX_SYSTEM_PROMPT_CHARS = 100 * 1024;
 
 /**
+ * LOO-18 item 3: liveness heartbeat interval (ms). While a tool is IN-FLIGHT (a
+ * `tool_use` has been emitted and its `tool_result` has not yet arrived) the SDK
+ * stream can stay silent for the tool's whole runtime — a long Bash, a big file
+ * op, a slow subprocess. Left alone the session-router's idle watchdog would read
+ * that silence as a stall and surface a false timeout. So while `inFlightTools` is
+ * non-empty we tick this interval and fire the same "still running" beacon a real
+ * SDK message would, refreshing the router's `lastEventAt`.
+ *
+ * The beacon fires ONLY when a tool is in-flight — never on a bare quiet turn.
+ * That is the deliberate "alive vs truly wedged" discriminator (LOO-18): an
+ * in-flight tool means a subprocess is genuinely running (alive → keep it out of
+ * the idle timeout); NO in-flight tool + a silent stream means the turn is waiting
+ * on the model with nothing progressing (truly wedged → let the idle watchdog, and
+ * ultimately the 30-min total backstop, do their job). Crucially the heartbeat
+ * only ever refreshes the IDLE beacon; it can never touch the TOTAL ceiling, so
+ * even a tool that hangs forever (heartbeating the whole time) is still bounded by
+ * total — the heartbeat can never degrade into "never times out".
+ *
+ * 20s mirrors the SDK bridge's own heartbeat cadence (well under the multi-minute
+ * idle window, so a single missed tick can't trip a false timeout).
+ */
+const LIVENESS_HEARTBEAT_INTERVAL_MS = 20_000;
+
+/**
  * Query Claude Agent SDK with structural role separation.
  *
  * - userMessage is passed as the SDK `prompt` (user role).
@@ -307,7 +331,7 @@ export async function* queryAgent(
   config: Config,
   sessionCtx?: SessionCtx,
   onToolUse?: (toolName: string, toolInput?: unknown) => void,
-  opts?: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; personaHint?: string; onAgentEvent?: (event: AgentStreamEvent) => void; onActivity?: () => void },
+  opts?: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; memoryDir?: string; mcpServers?: Record<string, McpServerConfig>; onResumeFailed?: () => void; fallbackRetryPrompt?: string; exposeSkillInstallPaths?: boolean; personaHint?: string; onAgentEvent?: (event: AgentStreamEvent) => void; onActivity?: () => void; heartbeatIntervalMs?: number },
 ): AsyncIterable<string> {
   const permissionMode = toPermissionMode(config.sdk.permissionMode);
   const settingSources = toSettingSources(config.sdk.settingSources);
@@ -368,6 +392,14 @@ export async function* queryAgent(
       console.error(`[cc-channel-octo] onActivity callback threw: ${String(err)}`);
     }
   };
+
+  // LOO-18 item 3: ids of tool_use blocks whose matching tool_result has NOT yet
+  // arrived — i.e. tools currently executing. The liveness heartbeat below beats
+  // only while this set is non-empty (a tool subprocess is genuinely running), so
+  // a long tool run never reads as an idle stall while a truly-wedged turn (no
+  // in-flight tool) still trips the watchdog. Lives at queryAgent scope so it
+  // spans the (possible) resume-recovery retry; cleared when a stream ends.
+  const inFlightTools = new Set<string>();
 
   // Build + iterate the SDK stream for a given resume id and prompt. Extracted so
   // a stale/expired `resume` (the SDK throws "No conversation found with session
@@ -501,6 +533,9 @@ export async function* queryAgent(
                 ? (block as { id: string }).id
                 : undefined;
               const input = (block as { input?: unknown }).input;
+              // LOO-18 item 3: mark this tool in-flight so the liveness heartbeat
+              // treats the (possibly long, event-less) tool runtime as "alive".
+              if (id) inFlightTools.add(id);
               emitAgentEvent({ kind: 'tool_start', name, input, ...(id ? { id } : {}) });
               if (onToolUse) {
                 try {
@@ -521,6 +556,10 @@ export async function* queryAgent(
               const b = block as { type?: unknown; tool_use_id?: unknown; is_error?: unknown };
               if (b.type !== 'tool_result') continue;
               const id = typeof b.tool_use_id === 'string' ? b.tool_use_id : undefined;
+              // LOO-18 item 3: the tool finished — clear its in-flight mark so the
+              // heartbeat stops beating once no tool is running (the naturally-quiet
+              // model/settle phase is then correctly subject to the idle watchdog).
+              if (id) inFlightTools.delete(id);
               emitAgentEvent({ kind: 'tool_end', ...(id ? { id } : {}), isError: b.is_error === true });
             }
           }
@@ -540,14 +579,32 @@ export async function* queryAgent(
         }
       }
     } finally {
+      // LOO-18 item 3: a stream ended (normally or by throw) — drop any lingering
+      // in-flight marks so a mid-flight failure can't leave the heartbeat beating
+      // into the recovery retry (which produces its own fresh events anyway).
+      inFlightTools.clear();
       s.close();
     }
   }
 
-  const emitted = { any: false };
+  // LOO-18 item 3: tick the liveness beacon while a tool is in-flight (see
+  // LIVENESS_HEARTBEAT_INTERVAL_MS). Spans the whole query — including the
+  // resume-recovery retry below — and is always cleared in the finally so it can
+  // never outlive the turn or hold the event loop open (also unref'd defensively).
+  const heartbeatMs = opts?.heartbeatIntervalMs ?? LIVENESS_HEARTBEAT_INTERVAL_MS;
+  const heartbeat =
+    opts?.onActivity && heartbeatMs > 0
+      ? setInterval(() => {
+          if (inFlightTools.size > 0) emitActivity();
+        }, heartbeatMs)
+      : undefined;
+  if (heartbeat && typeof heartbeat.unref === 'function') heartbeat.unref();
+
   try {
-    yield* drainStream(stream, emitted);
-  } catch (err) {
+    const emitted = { any: false };
+    try {
+      yield* drainStream(stream, emitted);
+    } catch (err) {
     // Stale/expired resume (verified by spike: the SDK throws "No conversation
     // found with session ID: …"). If it failed BEFORE any output and we were
     // resuming, recover: tell the caller to clear the bad id, then retry once
@@ -591,5 +648,9 @@ export async function* queryAgent(
       }
     }
     throw err;
+    }
+  } finally {
+    // LOO-18 item 3: always stop the heartbeat when the query settles.
+    if (heartbeat) clearInterval(heartbeat);
   }
 }
