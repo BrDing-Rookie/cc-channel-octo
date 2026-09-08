@@ -6,6 +6,7 @@ import type { DbAdapter, PreparedStatement } from './db-adapter.js';
 import { getGroupMembers, fetchUserInfo } from './octo/api.js';
 import { extractParentGroupNo } from './octo/channel-id.js';
 import { sanitizeDisplayName, formatSenderLabel } from './prompt-safety.js';
+import { MessageType } from './octo/types.js';
 
 interface GroupMessage {
   fromUid: string;
@@ -43,6 +44,7 @@ export class GroupContext {
   private selectRecentMessages!: PreparedStatement;
   private deleteOldMessages!: PreparedStatement;
   private selectMessagesSince!: PreparedStatement;
+  private selectFileRefsSince!: PreparedStatement;
   private selectMaxId!: PreparedStatement;
   private upsertCursor!: PreparedStatement;
   private selectCursor!: PreparedStatement;
@@ -62,9 +64,37 @@ export class GroupContext {
         from_uid TEXT NOT NULL,
         from_name TEXT NOT NULL,
         content TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
+        timestamp INTEGER NOT NULL,
+        msg_type INTEGER,
+        media_url TEXT,
+        file_name TEXT
       )
     `);
+    // LOO-17 security follow-up (reviewer finding 1): persist the ORIGINAL
+    // MessageType and the buildMediaUrl-VALIDATED download URL/name as a
+    // provenance marker, so attachment refs are trusted by *source* (real
+    // MessageType.File) — never reconstructed from the forgeable display string
+    // (a plain Text of `[文件: x]\n<any url>` must NOT be treated as a File).
+    // These are metadata columns, not the file body, so the "content never
+    // enters the rolling cache" invariant still holds. Migrate existing tables.
+    try {
+      const cols = this.adapter
+        .prepare('PRAGMA table_info(group_messages)')
+        .all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === 'msg_type')) {
+        this.adapter.exec('ALTER TABLE group_messages ADD COLUMN msg_type INTEGER');
+      }
+      if (!cols.some((c) => c.name === 'media_url')) {
+        this.adapter.exec('ALTER TABLE group_messages ADD COLUMN media_url TEXT');
+      }
+      if (!cols.some((c) => c.name === 'file_name')) {
+        this.adapter.exec('ALTER TABLE group_messages ADD COLUMN file_name TEXT');
+      }
+    } catch (err) {
+      throw new Error(
+        `group-context: group_messages column migration failed — database is in an unknown state. Underlying error: ${String(err)}`,
+      );
+    }
     this.adapter.exec(`
       CREATE INDEX IF NOT EXISTS idx_group_messages_channel
       ON group_messages (channel_id, id DESC)
@@ -93,7 +123,7 @@ export class GroupContext {
       'SELECT uid, name FROM group_members WHERE group_id = ?',
     );
     this.insertMessage = this.adapter.prepare(
-      'INSERT INTO group_messages (channel_id, from_uid, from_name, content, timestamp) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO group_messages (channel_id, from_uid, from_name, content, timestamp, msg_type, media_url, file_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     );
     this.selectRecentMessages = this.adapter.prepare(
       'SELECT from_uid, from_name, content, timestamp FROM group_messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?',
@@ -109,6 +139,12 @@ export class GroupContext {
     // order for display. Mirrors the in-memory buildContext rolling-window.
     this.selectMessagesSince = this.adapter.prepare(
       'SELECT id, from_uid, from_name, content FROM group_messages WHERE channel_id = ? AND id > ? ORDER BY id DESC LIMIT ?',
+    );
+    // LOO-17: File-attachment refs from the delta window. Selects the persisted
+    // provenance columns (msg_type / media_url / file_name) — collectFileRefsSince
+    // gates on msg_type === File so a forged Text row can never be resolved.
+    this.selectFileRefsSince = this.adapter.prepare(
+      'SELECT id, from_uid, from_name, msg_type, media_url, file_name FROM group_messages WHERE channel_id = ? AND id > ? ORDER BY id DESC LIMIT ?',
     );
     this.selectMaxId = this.adapter.prepare(
       'SELECT MAX(id) AS maxId FROM group_messages WHERE channel_id = ?',
@@ -179,6 +215,14 @@ export class GroupContext {
     fromName: string,
     content: string,
     timestamp: number,
+    // LOO-17: provenance for a trusted attachment. `msgType` is the ORIGINAL
+    // MessageType; `mediaUrl` is the buildMediaUrl-VALIDATED download URL and
+    // `fileName` the sender-provided name — both set ONLY for a real
+    // MessageType.File by the caller. They let collectFileRefsSince trust by
+    // source instead of parsing the forgeable display string.
+    msgType?: number,
+    mediaUrl?: string,
+    fileName?: string,
   ): void {
     // SECURITY: fromName is the user-controlled IM display name and is rendered
     // into the [Group context] block as `<name>：<content>`. Bound + strip it at
@@ -217,7 +261,16 @@ export class GroupContext {
     }
 
     try {
-      this.insertMessage.run(channelId, fromUid, safeName, content, timestamp);
+      this.insertMessage.run(
+        channelId,
+        fromUid,
+        safeName,
+        content,
+        timestamp,
+        msgType ?? null,
+        mediaUrl ?? null,
+        fileName ?? null,
+      );
       // Trim old messages to keep DB bounded (keep 2x window for safety)
       this.deleteOldMessages.run(channelId, channelId, this.maxWindowSize * 2);
     } catch (err) {
@@ -489,6 +542,65 @@ export class GroupContext {
     if (selected.length === 0) return { text: '', lastId };
     selected.reverse(); // chronological order for display
     return { text: `${header}${selected.join('\n')}${trailer}`, lastId };
+  }
+
+  /**
+   * Collect trusted File attachments from the messages NEWER than `sinceId`
+   * (the same delta window `buildContextSince` renders), most-recent first,
+   * capped at `maxFiles`.
+   *
+   * LOO-17 security follow-up (reviewer finding 1): trust by SOURCE, not by
+   * string shape. A ref is returned ONLY when the row's persisted
+   * `msg_type === MessageType.File` AND it carries a `media_url` that was
+   * already validated by `buildMediaUrl` at write time. A plain Text message
+   * whose content merely LOOKS like `[文件: x]\n<url>` has `msg_type = Text`
+   * (and no `media_url`), so it can never be resolved — closing the forged-marker
+   * SSRF/token-leak vector. `file_name` is re-sanitized here on read (defense in
+   * depth: never rely on the encode side having sanitized it).
+   *
+   * The rolling cache still stores no file body — these are provenance columns.
+   * The caller runs the download pipeline and injects content into the current
+   * turn only.
+   */
+  collectFileRefsSince(
+    channelId: string,
+    sinceId: number,
+    maxFiles: number,
+  ): Array<{ fromName: string; filename: string; url: string }> {
+    if (maxFiles <= 0) return [];
+    let rows: Array<{
+      id: number;
+      from_uid: string;
+      from_name: string;
+      msg_type: number | null;
+      media_url: string | null;
+      file_name: string | null;
+    }>;
+    try {
+      rows = this.selectFileRefsSince.all(channelId, sinceId, this.maxWindowSize) as typeof rows;
+    } catch (err) {
+      console.error(`group-context: collectFileRefsSince(${channelId}) failed: ${String(err)}`);
+      return [];
+    }
+    // rows are newest-first; keep the most-recent trusted File rows up to the cap.
+    const refs: Array<{ fromName: string; filename: string; url: string }> = [];
+    for (const r of rows) {
+      // Trust gate: original type MUST be File and the write-time validated URL
+      // MUST be present. Everything else (Text look-alikes, other media, legacy
+      // rows with NULL provenance) is skipped.
+      if (r.msg_type !== MessageType.File) continue;
+      if (typeof r.media_url !== 'string' || !r.media_url) continue;
+      const displayName = this.resolveDisplayName(channelId, r.from_uid, r.from_name);
+      refs.push({
+        fromName: formatSenderLabel(r.from_uid, displayName),
+        // Re-sanitize the decoded filename (don't trust encode-side sanitization).
+        filename: sanitizeDisplayName(r.file_name ?? '', '未知文件'),
+        url: r.media_url,
+      });
+      if (refs.length >= maxFiles) break;
+    }
+    refs.reverse(); // chronological order to match the rendered context
+    return refs;
   }
 
   resolveMentions(text: string, channelId: string): string[] {

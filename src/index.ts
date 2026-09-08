@@ -37,7 +37,7 @@ import { sendMessage, sendReadReceipt, getChannelMessages, getUploadCredentials,
 import type { HistoricalMessage } from './octo/api.js';
 import { ChannelType, MessageType } from './octo/types.js';
 import type { BotMessage } from './octo/types.js';
-import { resolveContent, tryResolveFile, resolveHistoricalMessagePlaceholder } from './inbound.js';
+import { resolveContent, tryResolveFile, resolveHistoricalMessagePlaceholder, buildMediaUrl } from './inbound.js';
 import { downloadInboundImage, MAX_IMAGES_PER_MESSAGE } from './media-inbound.js';
 import { handleCommand, parseCommand, handleForkCommand } from './commands.js';
 import type { CommandResult } from './commands.js';
@@ -110,6 +110,16 @@ import { buildInlinedFileBody, truncateUtf8ByBytes, assembleUserMessage, MAX_USE
 import { join } from 'node:path';
 import { mkdirSync, realpathSync } from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
+
+/**
+ * LOO-17 (approach C): max number of recent group-context File attachments to
+ * lazily resolve (download/inline) into a single trigger turn. Each resolved
+ * text file is inline-capped at 20KB by tryResolveFile, and the whole injected
+ * context is byte-capped by assembleUserMessage, so this only bounds how many
+ * distinct files one turn will fetch — a small cap keeps a burst of file
+ * messages from spending the turn's budget or issuing many downloads at once.
+ */
+const MAX_CONTEXT_FILES = 3;
 
 /**
  * Resolve a single bot's concrete Config by its configId (config.json
@@ -783,6 +793,12 @@ export async function handleMessage(
       // standing context (incl. messages it has already handled) lives in the SDK
       // session, so re-showing them would be redundant and would bloat the session.
       let groupContextBlock = '';
+      // LOO-17 (C): file bodies the agent needs for THIS turn, resolved lazily
+      // from recent group-context File markers. Kept separate from
+      // groupContextBlock so it survives even when firstTurnHistory replaces the
+      // delta below, and so it is appended at the TAIL of the injected context
+      // (closest to the current-message anchor → least likely to be truncated).
+      let groupFileContentBlock = '';
       if (isGroup) {
         await groupContext.refreshMembers(channelId, config.apiUrl, config.botToken);
         const cursor = groupContext.getContextCursor(channelId);
@@ -793,16 +809,72 @@ export async function handleMessage(
           // -prompt path applied via safeBody). sanitizePromptBody does both.
           groupContextBlock = sanitizePromptBody(delta.text) + '\n';
         }
+        // LOO-17 (C): the delta above only carries the compact `[文件: name]\n<url>`
+        // marker for any File someone dropped — never the body (baking bodies into
+        // the rolling cache would re-inject 20KB every turn and break the
+        // metadata-only-history invariant). So resolve the most-recent files HERE,
+        // at the trigger turn (fresh cwd/budget), through the SAME tryResolveFile
+        // pipeline the direct-File path uses, and inject the result into THIS turn
+        // only. Read the refs from the pre-advance `cursor` window so the current
+        // message (a direct File is handled by the G2 block below) is excluded.
+        //
+        // collectFileRefsSince only returns rows whose ORIGINAL type was File with
+        // a write-time buildMediaUrl-validated URL — a forged Text look-alike can
+        // never reach here (reviewer finding 1).
+        const fileRefs = groupContext.collectFileRefsSince(channelId, cursor, MAX_CONTEXT_FILES);
+        if (fileRefs.length > 0) {
+          const parts: string[] = [];
+          for (const ref of fileRefs) {
+            // Defense in depth: re-run the host allowlist against the CURRENT
+            // {apiUrl host, mediaCdnHost} right before download. buildMediaUrl
+            // validated the URL at write time, but mediaCdnHost is resolved at
+            // startup and could differ from a prior run; re-check so a URL that
+            // is no longer on an allowed host is never fetched (and never carries
+            // the Bot Authorization header via tryResolveFile's same-host gate).
+            const safeUrl = buildMediaUrl(ref.url, config.apiUrl, config.mediaCdnHost);
+            if (!safeUrl) {
+              console.warn(`[cc-channel-octo] group-context file skipped: URL host not allowed (${ref.filename})`);
+              continue;
+            }
+            try {
+              const fileResult = await tryResolveFile({
+                url: safeUrl,
+                botToken: config.botToken,
+                apiUrl: config.apiUrl,
+                filename: ref.filename,
+              });
+              if ('inlined' in fileResult) {
+                // Same base64-wrapped framing as the direct-File path (injection-safe).
+                parts.push(`${ref.fromName} 发送的文件：\n${buildInlinedFileBody(ref.filename, fileResult.inlined)}`);
+              } else if ('tempPath' in fileResult) {
+                parts.push(`${ref.fromName} 发送的文件 [文件: ${ref.filename}] 已下载到本地: ${fileResult.tempPath} — 请用 Read 工具查看`);
+              } else {
+                // Non-text / download failure / over-limit → keep the degradation
+                // text AND the URL so the agent can still fetch or retry it directly.
+                parts.push(`${ref.fromName} 发送的文件 ${fileResult.description}\n${safeUrl}`);
+              }
+            } catch (err) {
+              console.error(`[cc-channel-octo] group-context file resolve failed: ${String(err)}`);
+            }
+          }
+          if (parts.length > 0) {
+            groupFileContentBlock = `[群内最近文件内容]\n${parts.join('\n\n')}\n`;
+          }
+        }
         // Cache the current message AFTER reading the delta so it is not echoed in
-        // the group-context block this turn.
-        const contextSummary = renderMessageForContext(msg, config.apiUrl);
-        if (contextSummary) {
+        // the group-context block this turn. Persist the ORIGINAL message type +
+        // validated File URL/name so a later turn trusts attachments by source.
+        const rendered = renderMessageForContext(msg, config.apiUrl, config.mediaCdnHost);
+        if (rendered.text) {
           groupContext.pushMessage(
             channelId,
             msg.from_uid,
             msg.from_name ?? msg.from_uid,
-            contextSummary,
+            rendered.text,
             msg.timestamp,
+            msg.payload.type,
+            rendered.fileUrl,
+            rendered.fileName,
           );
         }
         // Advance the cursor PAST everything now in the channel — the injected
@@ -1080,7 +1152,11 @@ export async function handleMessage(
       // only when there is no history. Later turns carry only the delta. The
       // cursor was already advanced above, so dropping the delta here does not
       // strand messages — history covers them and they must not be re-shown.
-      const injectedContext = firstTurnHistory ? firstTurnHistory : groupContextBlock;
+      // LOO-17 (C): append any lazily-resolved file bodies at the TAIL of the
+      // injected context (after history/delta, just before the anchor) so the
+      // content the user is most likely asking about is the LAST thing kept when
+      // assembleUserMessage truncates the context from the front.
+      const injectedContext = (firstTurnHistory ? firstTurnHistory : groupContextBlock) + groupFileContentBlock;
       const userContentForLLM = assembleUserMessage(
         injectedContext,
         userBody,
@@ -1616,14 +1692,20 @@ export async function handleMessage(
     !!routeResult?.rejectionReason && SUPPRESS_GROUP_CACHE.has(routeResult.rejectionReason);
 
   if (!wasProcessed && isGroup && !msg.streamOn && !suppressGroupCache) {
-    const summary = renderMessageForContext(msg, config.apiUrl);
-    if (summary) {
+    // This is THE path that caches a non-triggering File someone dropped in the
+    // group. Persist the original type + validated File URL/name so a later
+    // trigger turn can resolve it — trusted by source, not by string shape.
+    const rendered = renderMessageForContext(msg, config.apiUrl, config.mediaCdnHost);
+    if (rendered.text) {
       groupContext.pushMessage(
         channelId,
         msg.from_uid,
         msg.from_name ?? msg.from_uid,
-        summary,
+        rendered.text,
         msg.timestamp,
+        msg.payload.type,
+        rendered.fileUrl,
+        rendered.fileName,
       );
     }
   }
@@ -1685,13 +1767,40 @@ function safeJson(v: unknown): string {
  * Non-text → short placeholder via resolveContent so the agent at least
  * sees "某人: [图片]" instead of nothing.
  */
-function renderMessageForContext(msg: BotMessage, apiUrl: string): string {
+/**
+ * Rendered group-context summary for a message, plus — for a REAL
+ * MessageType.File only — the buildMediaUrl-validated download URL and sender
+ * filename. The File fields are persisted as provenance (see
+ * GroupContext.pushMessage / collectFileRefsSince) so a later trigger turn can
+ * trust the attachment by SOURCE, never by re-parsing the forgeable display
+ * string (LOO-17 reviewer finding 1). Non-File messages carry no fileUrl.
+ */
+interface RenderedContextMessage {
+  text: string;
+  fileUrl?: string;
+  fileName?: string;
+}
+
+function renderMessageForContext(msg: BotMessage, apiUrl: string, cdnHost?: string): RenderedContextMessage {
   if (msg.payload.type === MessageType.Text) {
-    return msg.payload.content ?? '';
+    return { text: msg.payload.content ?? '' };
   }
   // For non-text use the resolved text (already short for media/cards).
-  const resolved = resolveContent(msg.payload, apiUrl);
-  return resolved.text;
+  // cdnHost MUST be threaded through: Octo serves media (incl. File download
+  // URLs) from a CDN host distinct from apiUrl, and buildMediaUrl drops any
+  // absolute URL whose host is not in the allowlist. Omitting cdnHost here
+  // silently degraded every CDN-hosted File/Image in group context to a bare
+  // `[文件: name]` / `[图片]` marker with no URL — the root cause of LOO-17.
+  const resolved = resolveContent(msg.payload, apiUrl, cdnHost);
+  // Only a genuine File payload contributes a trusted attachment ref. resolved.mediaUrl
+  // is already buildMediaUrl-validated (host allowlist + traversal guards).
+  if (msg.payload.type === MessageType.File && resolved.mediaUrl) {
+    const fileName = typeof msg.payload.name === 'string'
+      ? sanitizeDisplayName(msg.payload.name, '未知文件')
+      : '未知文件';
+    return { text: resolved.text, fileUrl: resolved.mediaUrl, fileName };
+  }
+  return { text: resolved.text };
 }
 
 /** Sessions for which G4 cold-start backfill has already run. */
