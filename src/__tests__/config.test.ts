@@ -93,8 +93,9 @@ describe('loadConfig defaults', () => {
     expect(cfg.context.maxContextChars).toBe(6000);
     expect(cfg.context.historyLimit).toBe(40);
     expect(cfg.botBlocklist).toBeUndefined();
-    // #141 refit: idle (primary) 2 min, dispatch backstop 30 min (demoted).
-    expect(cfg.idleTimeoutMs).toBe(120_000);
+    // #141 refit: idle (primary) watchdog; dispatch backstop 30 min (demoted).
+    // LOO-18 raised the idle default 2 min → 4 min (heartbeat now covers tool quiet).
+    expect(cfg.idleTimeoutMs).toBe(240_000);
     expect(cfg.dispatchTimeoutMs).toBe(1_800_000);
 
     // Per-bot dirs are derived under <baseDir>/<botId>/… (single bot → default).

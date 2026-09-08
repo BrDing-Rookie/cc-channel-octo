@@ -431,7 +431,20 @@ export interface Config {
    * never cancel the in-flight turn, so we must never let a follow-up message on
    * the same session start a concurrent query — it queues behind the lock until
    * the turn settles). Merged per-bot like the other top-level fields; clamped to
-   * 2**31-1 before use (#121). 0 disables the idle level. Default 2 minutes.
+   * 2**31-1 before use (#121). 0 disables the idle level.
+   *
+   * Default 4 minutes (LOO-18, raised from 2 min). Basis: the D3 incident tripped
+   * idle at exactly 2 min because a healthy turn's SDK stream can stay quiet that
+   * long. Two things changed with LOO-18: (a) the agent-bridge liveness heartbeat
+   * now refreshes the beacon while a TOOL is in-flight, so a long Bash/tool run no
+   * longer counts as quiet at all; (b) with tool-execution quiet covered, the only
+   * remaining silent window a healthy turn hits is pure MODEL-side latency
+   * (extended thinking + first-token before the SDK emits anything), observed up
+   * to ~2 min in that incident. 4 min gives ~2× headroom over the observed ceiling
+   * while the 30-min total backstop remains the real hard bound — so raising this
+   * only trims false idle notices, it does not weaken the stuck-turn guarantee.
+   * Tune per-bot (`idleTimeoutMs` in the per-bot overrides) for workloads with
+   * even longer legitimate model-latency spikes.
    */
   idleTimeoutMs?: number;
   /**
@@ -578,7 +591,7 @@ function defaults(): Config {
       historyLimit: 40,
     },
     maxResponseChars: 524_288, // 512 KB (Q32)
-    idleTimeoutMs: 120_000, // 2 min — primary activity-watchdog bound (#141 refit)
+    idleTimeoutMs: 240_000, // 4 min — primary activity-watchdog bound (#141; LOO-18 bump)
     dispatchTimeoutMs: 1_800_000, // 30 min — large lock-release backstop (#141, demoted)
   };
 }

@@ -125,3 +125,86 @@ describe("queryAgent onActivity (#141 liveness heartbeat)", () => {
     expect(chunks.join("")).toBe("hello");
   });
 });
+
+// A mock stream whose async iterator pauses `gapMs` after emitting the message at
+// `gapAfterIndex` — simulating an SDK stream that goes SILENT while a tool runs
+// (or, in the no-tool case, while the model is quiet). Real timers advance during
+// the pause, so the LOO-18 heartbeat interval fires (or not) exactly as in prod.
+function createPausingStream(
+  messages: Array<{ type: string; [k: string]: unknown }>,
+  gapAfterIndex: number,
+  gapMs: number,
+) {
+  return {
+    [Symbol.asyncIterator]: async function* () {
+      for (let i = 0; i < messages.length; i++) {
+        yield messages[i];
+        if (i === gapAfterIndex) await new Promise((r) => setTimeout(r, gapMs));
+      }
+    },
+    close: vi.fn(),
+  };
+}
+
+describe("queryAgent liveness heartbeat (LOO-18 item 3: in-flight-tool discriminator)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("beats during a long quiet gap WHILE a tool is in-flight", async () => {
+    // tool_use (in-flight) → 120ms of silence → tool_result. With a 20ms heartbeat
+    // the beacon must fire several extra times during the gap on top of the
+    // per-message beats, so a long tool run never reads as an idle stall.
+    mockQuery.mockReturnValue(createPausingStream([
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: false }] } },
+      { type: "result", subtype: "success" },
+    ], /* gapAfterIndex */ 0, /* gapMs */ 120));
+
+    let beats = 0;
+    for await (const _ of queryAgent("hi", makeConfig(), undefined, undefined, {
+      onActivity: () => { beats++; },
+      heartbeatIntervalMs: 20,
+    })) { void _; }
+
+    // 3 per-message beats + at least one heartbeat beat across the in-flight gap.
+    // (Contrast the no-tool test below, which gets EXACTLY its per-message beats.)
+    expect(beats).toBeGreaterThan(3);
+  });
+
+  it("does NOT beat during a quiet gap when NO tool is in-flight (truly-wedged discriminator)", async () => {
+    // assistant TEXT (no tool) → 120ms of silence → result. No tool is in-flight,
+    // so the heartbeat criterion is FALSE and the beacon must NOT fire during the
+    // gap — leaving the (real) idle watchdog free to judge this quiet a stall.
+    mockQuery.mockReturnValue(createPausingStream([
+      { type: "assistant", message: { content: [{ type: "text", text: "thinking done" }] } },
+      { type: "result", subtype: "success" },
+    ], /* gapAfterIndex */ 0, /* gapMs */ 120));
+
+    let beats = 0;
+    for await (const _ of queryAgent("hi", makeConfig(), undefined, undefined, {
+      onActivity: () => { beats++; },
+      heartbeatIntervalMs: 20,
+    })) { void _; }
+
+    // Exactly the 2 per-message beats — the 120ms gap added none (no in-flight tool).
+    expect(beats).toBe(2);
+  });
+
+  it("stops beating once the tool's result arrives (in-flight set drains)", async () => {
+    // tool_use → tool_result (tool done) → 120ms quiet settle → result. After the
+    // result arrives the in-flight set is empty, so the post-tool quiet adds no
+    // heartbeats — only the 3 per-message beats.
+    mockQuery.mockReturnValue(createPausingStream([
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: false }] } },
+      { type: "result", subtype: "success" },
+    ], /* gapAfterIndex */ 1, /* gapMs */ 120));
+
+    let beats = 0;
+    for await (const _ of queryAgent("hi", makeConfig(), undefined, undefined, {
+      onActivity: () => { beats++; },
+      heartbeatIntervalMs: 20,
+    })) { void _; }
+
+    expect(beats).toBe(3);
+  });
+});
