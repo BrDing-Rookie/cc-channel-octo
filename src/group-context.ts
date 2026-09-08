@@ -6,6 +6,7 @@ import type { DbAdapter, PreparedStatement } from './db-adapter.js';
 import { getGroupMembers, fetchUserInfo } from './octo/api.js';
 import { extractParentGroupNo } from './octo/channel-id.js';
 import { sanitizeDisplayName, formatSenderLabel } from './prompt-safety.js';
+import { parseInboundFileMarker } from './inbound.js';
 
 interface GroupMessage {
   fromUid: string;
@@ -489,6 +490,59 @@ export class GroupContext {
     if (selected.length === 0) return { text: '', lastId };
     selected.reverse(); // chronological order for display
     return { text: `${header}${selected.join('\n')}${trailer}`, lastId };
+  }
+
+  /**
+   * Collect downloadable File attachments from the messages NEWER than
+   * `sinceId` (the same delta window `buildContextSince` renders), most-recent
+   * first, capped at `maxFiles`.
+   *
+   * LOO-17 (approach C): the rolling cache stores only the compact
+   * `[文件: name]\n<url>` marker — never the file body (that would violate the
+   * "history holds metadata only, content is per-turn" invariant and re-inject
+   * a 20KB block every turn). Instead, at the trigger turn the caller takes
+   * these refs, runs the SAME `tryResolveFile` inline/temp/URL pipeline, and
+   * injects the result into THIS turn's context only. This returns just the
+   * `{ fromName, filename, url }` triples; the caller owns the download.
+   *
+   * Only File markers carrying a usable URL are returned (see
+   * `parseInboundFileMarker`); everything else (bare markers, other media,
+   * plain text) is skipped. `fromName` is a display label already sanitized by
+   * `formatSenderLabel`.
+   */
+  collectFileRefsSince(
+    channelId: string,
+    sinceId: number,
+    maxFiles: number,
+  ): Array<{ fromName: string; filename: string; url: string }> {
+    if (maxFiles <= 0) return [];
+    let rows: Array<{ id: number; from_uid: string; from_name: string; content: string }>;
+    try {
+      rows = this.selectMessagesSince.all(channelId, sinceId, this.maxWindowSize) as Array<{
+        id: number;
+        from_uid: string;
+        from_name: string;
+        content: string;
+      }>;
+    } catch (err) {
+      console.error(`group-context: collectFileRefsSince(${channelId}) failed: ${String(err)}`);
+      return [];
+    }
+    // rows are newest-first; keep the most-recent files up to the cap.
+    const refs: Array<{ fromName: string; filename: string; url: string }> = [];
+    for (const r of rows) {
+      const parsed = parseInboundFileMarker(r.content);
+      if (!parsed) continue;
+      const displayName = this.resolveDisplayName(channelId, r.from_uid, r.from_name);
+      refs.push({
+        fromName: formatSenderLabel(r.from_uid, displayName),
+        filename: parsed.filename,
+        url: parsed.url,
+      });
+      if (refs.length >= maxFiles) break;
+    }
+    refs.reverse(); // chronological order to match the rendered context
+    return refs;
   }
 
   resolveMentions(text: string, channelId: string): string[] {

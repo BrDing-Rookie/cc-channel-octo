@@ -544,6 +544,42 @@ export function resolveHistoricalMessagePlaceholder(type?: number, name?: string
   }
 }
 
+/**
+ * Parse a cached File marker back into `{ filename, url }`.
+ *
+ * `resolveContent(File)` renders a downloadable file as exactly:
+ *
+ *   [文件: <sanitized-name>]
+ *   <absolute http(s) url>
+ *
+ * and that string is what the group-context cache stores (see index.ts
+ * `renderMessageForContext`). To lazily resolve a file the agent asks about
+ * later (LOO-17 approach C: resolve at the trigger turn, never bake content
+ * into the rolling cache), the trigger-turn group-context builder needs the
+ * filename + URL back out of that marker. This is the single place that
+ * decodes the marker so the encode side (`resolveContent`) and the decode side
+ * stay in lockstep.
+ *
+ * Returns null for anything that isn't a File marker carrying a usable URL
+ * (bare `[文件: name]` with no URL, other media types, plain text). The name
+ * was already sanitized on the encode side, so it is safe to re-embed.
+ */
+export function parseInboundFileMarker(content: string): { filename: string; url: string } | null {
+  if (typeof content !== 'string') return null;
+  const nl = content.indexOf('\n');
+  if (nl < 0) return null;
+  const firstLine = content.slice(0, nl);
+  const match = /^\[文件: (.+)\]$/.exec(firstLine);
+  if (!match) return null;
+  // The URL sits on the line immediately after the marker. Take only that
+  // line and require an absolute http(s) URL (relative paths were already
+  // absolutized by buildMediaUrl before caching; a missing URL means the
+  // marker is bare and there is nothing to download).
+  const url = content.slice(nl + 1).split('\n', 1)[0].trim();
+  if (!url.startsWith('http://') && !url.startsWith('https://')) return null;
+  return { filename: match[1], url };
+}
+
 // ─── File inlining (G2) ────────────────────────────────────────────────────
 
 /** Best-effort cleanup of temp files older than 1 hour. */

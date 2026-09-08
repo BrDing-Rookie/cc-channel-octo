@@ -112,6 +112,16 @@ import { mkdirSync, realpathSync } from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
 /**
+ * LOO-17 (approach C): max number of recent group-context File attachments to
+ * lazily resolve (download/inline) into a single trigger turn. Each resolved
+ * text file is inline-capped at 20KB by tryResolveFile, and the whole injected
+ * context is byte-capped by assembleUserMessage, so this only bounds how many
+ * distinct files one turn will fetch — a small cap keeps a burst of file
+ * messages from spending the turn's budget or issuing many downloads at once.
+ */
+const MAX_CONTEXT_FILES = 3;
+
+/**
  * Resolve a single bot's concrete Config by its configId (config.json
  * `bots[].id`). Re-reads via resolveBotConfigs so a bot added after boot picks
  * up the latest global+per-bot merge. Throws if the id is absent — the manager
@@ -783,6 +793,12 @@ export async function handleMessage(
       // standing context (incl. messages it has already handled) lives in the SDK
       // session, so re-showing them would be redundant and would bloat the session.
       let groupContextBlock = '';
+      // LOO-17 (C): file bodies the agent needs for THIS turn, resolved lazily
+      // from recent group-context File markers. Kept separate from
+      // groupContextBlock so it survives even when firstTurnHistory replaces the
+      // delta below, and so it is appended at the TAIL of the injected context
+      // (closest to the current-message anchor → least likely to be truncated).
+      let groupFileContentBlock = '';
       if (isGroup) {
         await groupContext.refreshMembers(channelId, config.apiUrl, config.botToken);
         const cursor = groupContext.getContextCursor(channelId);
@@ -793,9 +809,46 @@ export async function handleMessage(
           // -prompt path applied via safeBody). sanitizePromptBody does both.
           groupContextBlock = sanitizePromptBody(delta.text) + '\n';
         }
+        // LOO-17 (C): the delta above only carries the compact `[文件: name]\n<url>`
+        // marker for any File someone dropped — never the body (baking bodies into
+        // the rolling cache would re-inject 20KB every turn and break the
+        // metadata-only-history invariant). So resolve the most-recent files HERE,
+        // at the trigger turn (fresh cwd/budget), through the SAME tryResolveFile
+        // pipeline the direct-File path uses, and inject the result into THIS turn
+        // only. Read the refs from the pre-advance `cursor` window so the current
+        // message (a direct File is handled by the G2 block below) is excluded.
+        const fileRefs = groupContext.collectFileRefsSince(channelId, cursor, MAX_CONTEXT_FILES);
+        if (fileRefs.length > 0) {
+          const parts: string[] = [];
+          for (const ref of fileRefs) {
+            try {
+              const fileResult = await tryResolveFile({
+                url: ref.url,
+                botToken: config.botToken,
+                apiUrl: config.apiUrl,
+                filename: ref.filename,
+              });
+              if ('inlined' in fileResult) {
+                // Same base64-wrapped framing as the direct-File path (injection-safe).
+                parts.push(`${ref.fromName} 发送的文件：\n${buildInlinedFileBody(ref.filename, fileResult.inlined)}`);
+              } else if ('tempPath' in fileResult) {
+                parts.push(`${ref.fromName} 发送的文件 [文件: ${ref.filename}] 已下载到本地: ${fileResult.tempPath} — 请用 Read 工具查看`);
+              } else {
+                // Non-text / download failure / over-limit → keep the degradation
+                // text AND the URL so the agent can still fetch or retry it directly.
+                parts.push(`${ref.fromName} 发送的文件 ${fileResult.description}\n${ref.url}`);
+              }
+            } catch (err) {
+              console.error(`[cc-channel-octo] group-context file resolve failed: ${String(err)}`);
+            }
+          }
+          if (parts.length > 0) {
+            groupFileContentBlock = `[群内最近文件内容]\n${parts.join('\n\n')}\n`;
+          }
+        }
         // Cache the current message AFTER reading the delta so it is not echoed in
         // the group-context block this turn.
-        const contextSummary = renderMessageForContext(msg, config.apiUrl);
+        const contextSummary = renderMessageForContext(msg, config.apiUrl, config.mediaCdnHost);
         if (contextSummary) {
           groupContext.pushMessage(
             channelId,
@@ -1080,7 +1133,11 @@ export async function handleMessage(
       // only when there is no history. Later turns carry only the delta. The
       // cursor was already advanced above, so dropping the delta here does not
       // strand messages — history covers them and they must not be re-shown.
-      const injectedContext = firstTurnHistory ? firstTurnHistory : groupContextBlock;
+      // LOO-17 (C): append any lazily-resolved file bodies at the TAIL of the
+      // injected context (after history/delta, just before the anchor) so the
+      // content the user is most likely asking about is the LAST thing kept when
+      // assembleUserMessage truncates the context from the front.
+      const injectedContext = (firstTurnHistory ? firstTurnHistory : groupContextBlock) + groupFileContentBlock;
       const userContentForLLM = assembleUserMessage(
         injectedContext,
         userBody,
@@ -1616,7 +1673,7 @@ export async function handleMessage(
     !!routeResult?.rejectionReason && SUPPRESS_GROUP_CACHE.has(routeResult.rejectionReason);
 
   if (!wasProcessed && isGroup && !msg.streamOn && !suppressGroupCache) {
-    const summary = renderMessageForContext(msg, config.apiUrl);
+    const summary = renderMessageForContext(msg, config.apiUrl, config.mediaCdnHost);
     if (summary) {
       groupContext.pushMessage(
         channelId,
@@ -1685,12 +1742,17 @@ function safeJson(v: unknown): string {
  * Non-text → short placeholder via resolveContent so the agent at least
  * sees "某人: [图片]" instead of nothing.
  */
-function renderMessageForContext(msg: BotMessage, apiUrl: string): string {
+function renderMessageForContext(msg: BotMessage, apiUrl: string, cdnHost?: string): string {
   if (msg.payload.type === MessageType.Text) {
     return msg.payload.content ?? '';
   }
   // For non-text use the resolved text (already short for media/cards).
-  const resolved = resolveContent(msg.payload, apiUrl);
+  // cdnHost MUST be threaded through: Octo serves media (incl. File download
+  // URLs) from a CDN host distinct from apiUrl, and buildMediaUrl drops any
+  // absolute URL whose host is not in the allowlist. Omitting cdnHost here
+  // silently degraded every CDN-hosted File/Image in group context to a bare
+  // `[文件: name]` / `[图片]` marker with no URL — the root cause of LOO-17.
+  const resolved = resolveContent(msg.payload, apiUrl, cdnHost);
   return resolved.text;
 }
 
