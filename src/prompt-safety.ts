@@ -92,6 +92,7 @@ const ROLE_LABEL_RE =
 
 /** Bracket delimiters + all line/para separators that could forge a boundary. */
 const NAME_UNSAFE_RE = /[[\]\r\n\v\f\u0085\u2028\u2029]/g;
+const FILE_NAME_CONTROL_RE = /[\u0000-\u001f\u007f]/g;
 
 /**
  * Unicode line/paragraph separators that JS regex `^`(m) does NOT anchor on but
@@ -116,6 +117,11 @@ export function sanitizeDisplayName(name: unknown, fallback = ''): string {
     .slice(0, MAX_DISPLAY_NAME_LEN)
     .trim();
   return cleaned.length > 0 ? cleaned : fallback;
+}
+
+/** Sanitize an untrusted file name while removing every C0 control byte. */
+export function sanitizeFileName(name: unknown, fallback = ''): string {
+  return sanitizeDisplayName(String(name ?? '').replace(FILE_NAME_CONTROL_RE, ' '), fallback);
 }
 
 /**
@@ -198,4 +204,3 @@ export function safeSectioned(text: string): SafeText {
 export function trustedText(text: string): SafeText {
   return text as SafeText;
 }
-
