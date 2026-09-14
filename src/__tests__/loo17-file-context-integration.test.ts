@@ -226,4 +226,27 @@ describe('LOO-17 handleMessage: group File resolution + no re-download + forged-
     expect(lastUserMsg()).not.toContain('[群内最近文件内容]');
     expect(lastUserMsg()).not.toContain(internalUrl);
   });
+
+  it.each([
+    `${API_URL}/file/%252e%252e/internal/secrets.txt`,
+    `${API_URL}/file/a%252fb/secrets.txt`,
+    `${API_URL}/file/a%255cb/secrets.txt`,
+    `${API_URL}/file/%252E%252e%252Finternal/secrets.txt`,
+  ])('NEGATIVE (review round 3): double-encoded File URL is never fetched: %s', async (encodedUrl) => {
+    await run(groupMsg({ type: MessageType.File, url: encodedUrl, name: 'secrets.txt' }, false));
+
+    const rows = adapter
+      .prepare('SELECT content, msg_type, media_url FROM group_messages WHERE msg_type = ?')
+      .all(MessageType.File) as Array<{ content: string; msg_type: number; media_url: string | null }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toBe('[文件: secrets.txt]');
+    expect(rows[0].media_url).toBeNull();
+
+    await run(groupMsg({ type: MessageType.Text, content: 'read the latest file' }, true));
+
+    expect(queryAgent).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(lastUserMsg()).not.toContain('[群内最近文件内容]');
+    expect(lastUserMsg()).not.toContain(encodedUrl);
+  });
 });

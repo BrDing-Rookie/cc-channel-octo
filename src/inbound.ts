@@ -224,9 +224,21 @@ export function buildFileMediaUrl(relUrl?: string, apiUrl?: string, cdnHost?: st
   const url = buildMediaUrl(relUrl, apiUrl, cdnHost);
   if (!url) return undefined;
   try {
-    const pathname = new URL(url).pathname;
-    if (!pathname.startsWith('/file/')) return undefined;
-    if (/%(?:2f|5c)/i.test(pathname)) return undefined;
+    const parsed = new URL(url);
+    let pathname = parsed.pathname;
+    const maxDecodeRounds = 4;
+    for (let round = 0; round <= maxDecodeRounds; round++) {
+      if (pathname.includes('\\')) return undefined;
+      if (/%(?:2f|5c)/i.test(pathname)) return undefined;
+      if (/(?:^|\/)(?:\.|%2e)(?:\.|%2e)?(?:\/|$)/i.test(pathname)) return undefined;
+
+      const normalized = new URL(pathname, parsed.origin);
+      if (normalized.origin !== parsed.origin || !normalized.pathname.startsWith('/file/')) return undefined;
+
+      if (!/%[0-9a-f]{2}/i.test(pathname)) return url;
+      if (round === maxDecodeRounds) return undefined;
+      pathname = decodeURIComponent(pathname);
+    }
     return url;
   } catch {
     return undefined;

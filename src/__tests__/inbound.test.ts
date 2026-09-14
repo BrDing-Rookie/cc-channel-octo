@@ -195,8 +195,18 @@ describe('buildFileMediaUrl', () => {
     'https://api.example.com/file/%2e%2e/internal/secrets.txt',
     'https://api.example.com/file/a%2fb/secrets.txt',
     'https://api.example.com/file/a%5cb/secrets.txt',
+    'https://api.example.com/file/%252e%252e/internal/secrets.txt',
+    'https://api.example.com/file/a%252fb/secrets.txt',
+    'https://api.example.com/file/a%255cb/secrets.txt',
+    'https://api.example.com/file/%252E%252e%252Finternal/secrets.txt',
+    'https://api.example.com/file/%25252e%25252e/internal/secrets.txt',
   ])('rejects URLs outside the canonical file namespace: %s', (url) => {
     expect(buildFileMediaUrl(url, API_URL)).toBeUndefined();
+  });
+
+  it('allows benign percent encoding after bounded recursive validation', () => {
+    expect(buildFileMediaUrl('https://api.example.com/file/My%2520Report.txt', API_URL))
+      .toBe('https://api.example.com/file/My%2520Report.txt');
   });
 });
 
