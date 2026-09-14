@@ -591,8 +591,13 @@ function defaults(): Config {
       historyLimit: 40,
     },
     maxResponseChars: 524_288, // 512 KB (Q32)
-    idleTimeoutMs: 240_000, // 4 min — primary activity-watchdog bound (#141; LOO-18 bump)
-    dispatchTimeoutMs: 1_800_000, // 30 min — large lock-release backstop (#141, demoted)
+    idleTimeoutMs: 240_000, // 4 min — soft "still working" notice only (LOO-19). The
+    // model-wait heartbeat now refreshes the beacon during BOTH tool runs and model
+    // waits, so a healthy turn never trips this regardless of how long it takes. Idle
+    // therefore no longer needs the runtime 10-min stopgap (that was masking the
+    // false positives this fix removes) and is demoted to a soft notice; the 30-min
+    // total below is the sole HARD backstop for a genuine iterator deadlock.
+    dispatchTimeoutMs: 1_800_000, // 30 min — large lock-release backstop, hard cap (never refreshed by heartbeat)
   };
 }
 

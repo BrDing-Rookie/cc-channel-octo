@@ -274,23 +274,39 @@ export function buildSystemPrompt(
 const MAX_SYSTEM_PROMPT_CHARS = 100 * 1024;
 
 /**
- * LOO-18 item 3: liveness heartbeat interval (ms). While a tool is IN-FLIGHT (a
- * `tool_use` has been emitted and its `tool_result` has not yet arrived) the SDK
- * stream can stay silent for the tool's whole runtime — a long Bash, a big file
- * op, a slow subprocess. Left alone the session-router's idle watchdog would read
- * that silence as a stall and surface a false timeout. So while `inFlightTools` is
- * non-empty we tick this interval and fire the same "still running" beacon a real
- * SDK message would, refreshing the router's `lastEventAt`.
+ * LOO-18/LOO-19: liveness heartbeat interval (ms). A healthy turn can go silent
+ * on the SDK stream for one of two reasons, and BOTH are "alive":
+ *   1. a tool is IN-FLIGHT — a `tool_use` was emitted and its `tool_result` has
+ *      not arrived yet (a long Bash, a big file op, a slow subprocess); or
+ *   2. the turn is WAITING ON THE MODEL — the last `tool_result` came back and the
+ *      next `tool_use`/`text` has not been generated yet, or the model is producing
+ *      a large block, or the API is slow / backing off a 429. No event is emitted
+ *      and no tool is in-flight, yet the query's async iterator is still pending.
  *
- * The beacon fires ONLY when a tool is in-flight — never on a bare quiet turn.
- * That is the deliberate "alive vs truly wedged" discriminator (LOO-18): an
- * in-flight tool means a subprocess is genuinely running (alive → keep it out of
- * the idle timeout); NO in-flight tool + a silent stream means the turn is waiting
- * on the model with nothing progressing (truly wedged → let the idle watchdog, and
- * ultimately the 30-min total backstop, do their job). Crucially the heartbeat
- * only ever refreshes the IDLE beacon; it can never touch the TOTAL ceiling, so
- * even a tool that hangs forever (heartbeating the whole time) is still bounded by
- * total — the heartbeat can never degrade into "never times out".
+ * LOO-18 shipped only case 1 (`inFlightTools`). Case 2 is in fact the MOST common
+ * healthy silence, and treating it as a stall is what produced the false idle
+ * timeouts / stalled cards LOO-19 fixes. So we now beat while EITHER holds:
+ * `inFlightTools` is non-empty OR a drainStream `for await` is still iterating the
+ * SDK stream (`streamActive` — the iterator has neither yielded the next message
+ * nor settled). Effectively: as long as the turn is still running (waiting on the
+ * model OR on a tool), it counts as alive and refreshes the router's `lastEventAt`.
+ *
+ * Why the iterator's pending-state is the right liveness signal here, and its
+ * limits: the local daemon path drives the agent through the SDK `query()`, which
+ * returns an async iterable — NOT the child-process handle or the underlying
+ * socket. So we cannot read "subprocess alive" or "connection live" directly; the
+ * iterator's pending-vs-settled state is the only liveness signal this path
+ * exposes. It is a faithful proxy for both: if the child or the connection dies,
+ * the SDK settles the iterator (it throws or completes), which flips `streamActive`
+ * false. The cost of only having this signal is that we CANNOT distinguish a
+ * healthy model-wait from a genuine SDK-iterator deadlock (an iterator that never
+ * yields and never settles) — both keep the iterator pending. We therefore do NOT
+ * try to detect true deadlock from idle; per the design we make the 30-min TOTAL
+ * ceiling the sole HARD backstop for it. Crucially the heartbeat only ever refreshes
+ * the IDLE beacon (`lastEventAt`); it can NEVER touch the TOTAL ceiling (measured
+ * from turn start and never refreshed — see session-router `runHandlerWithTimeout`),
+ * so even an iterator that stays pending forever (heartbeating the whole time) is
+ * still bounded by total. The heartbeat can never degrade into "never times out".
  *
  * 20s mirrors the SDK bridge's own heartbeat cadence (well under the multi-minute
  * idle window, so a single missed tick can't trip a false timeout).
@@ -394,12 +410,23 @@ export async function* queryAgent(
   };
 
   // LOO-18 item 3: ids of tool_use blocks whose matching tool_result has NOT yet
-  // arrived — i.e. tools currently executing. The liveness heartbeat below beats
-  // only while this set is non-empty (a tool subprocess is genuinely running), so
-  // a long tool run never reads as an idle stall while a truly-wedged turn (no
-  // in-flight tool) still trips the watchdog. Lives at queryAgent scope so it
-  // spans the (possible) resume-recovery retry; cleared when a stream ends.
+  // arrived — i.e. tools currently executing. Lives at queryAgent scope so it spans
+  // the (possible) resume-recovery retry; cleared when a stream ends. One of the two
+  // liveness inputs to the heartbeat below (see LIVENESS_HEARTBEAT_INTERVAL_MS).
   const inFlightTools = new Set<string>();
+
+  // LOO-19: true while a drainStream `for await` is actively iterating the SDK
+  // stream — i.e. the query's async iterator is still pending (it has neither
+  // yielded the next message nor settled). This is the signal that a model-wait
+  // silence (no in-flight tool, but the turn is still running) is ALIVE, which is
+  // the most common healthy silence and the false-timeout source LOO-19 fixes. It
+  // subsumes `inFlightTools` (a tool run is also a pending iteration), but both are
+  // fed to the heartbeat for explicitness and defense-in-depth. Flips false in
+  // drainStream's `finally` on every stream end (normal, throw, or recovery retry),
+  // so a settled/failed iterator stops the beat and lets the watchdogs judge the
+  // rest. See LIVENESS_HEARTBEAT_INTERVAL_MS for why this is the only reliable
+  // liveness signal on the local daemon path and why total remains the hard cap.
+  let streamActive = false;
 
   // Build + iterate the SDK stream for a given resume id and prompt. Extracted so
   // a stale/expired `resume` (the SDK throws "No conversation found with session
@@ -478,6 +505,11 @@ export async function* queryAgent(
     emitted: { any: boolean },
   ): AsyncIterable<string> {
     let reportedSessionId = false;
+    // LOO-19: mark the SDK iterator as actively pending for this drain. The
+    // heartbeat treats a model-wait silence between messages as alive while this
+    // holds. Cleared in the finally on any stream end so it can't beat into the gap
+    // between the original stream and a recovery retry, or past turn settle.
+    streamActive = true;
     try {
       for await (const message of s) {
         // #141: heartbeat FIRST, for every message type (even a bare system /
@@ -579,6 +611,11 @@ export async function* queryAgent(
         }
       }
     } finally {
+      // LOO-19: this drain's iterator has settled (normal end, throw, or the
+      // consumer stopped pulling) — stop treating it as pending so the beat can't
+      // outlive the stream. A recovery retry re-enters drainStream and sets it true
+      // again for its own iteration.
+      streamActive = false;
       // LOO-18 item 3: a stream ended (normally or by throw) — drop any lingering
       // in-flight marks so a mid-flight failure can't leave the heartbeat beating
       // into the recovery retry (which produces its own fresh events anyway).
@@ -587,15 +624,17 @@ export async function* queryAgent(
     }
   }
 
-  // LOO-18 item 3: tick the liveness beacon while a tool is in-flight (see
-  // LIVENESS_HEARTBEAT_INTERVAL_MS). Spans the whole query — including the
-  // resume-recovery retry below — and is always cleared in the finally so it can
-  // never outlive the turn or hold the event loop open (also unref'd defensively).
+  // LOO-18/LOO-19: tick the liveness beacon while the turn is still running (see
+  // LIVENESS_HEARTBEAT_INTERVAL_MS). Beats when EITHER a tool is in-flight OR the
+  // SDK iterator is still pending (`streamActive` — i.e. waiting on the model to
+  // generate the next message). Spans the whole query — including the resume-
+  // recovery retry below — and is always cleared in the finally so it can never
+  // outlive the turn or hold the event loop open (also unref'd defensively).
   const heartbeatMs = opts?.heartbeatIntervalMs ?? LIVENESS_HEARTBEAT_INTERVAL_MS;
   const heartbeat =
     opts?.onActivity && heartbeatMs > 0
       ? setInterval(() => {
-          if (inFlightTools.size > 0) emitActivity();
+          if (streamActive || inFlightTools.size > 0) emitActivity();
         }, heartbeatMs)
       : undefined;
   if (heartbeat && typeof heartbeat.unref === 'function') heartbeat.unref();

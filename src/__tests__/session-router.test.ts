@@ -6,6 +6,7 @@ vi.mock('../octo/api.js', () => ({
 }));
 
 import { SessionRouter } from '../session-router.js';
+import type { RouteResult } from '../session-router.js';
 import type { BotMessage } from '../octo/types.js';
 import { ChannelType, MessageType } from '../octo/types.js';
 import type { Config } from '../config.js';
@@ -927,6 +928,53 @@ describe('idle watchdog (#141 activity-based dispatch bound)', () => {
     await Promise.all([p1, p2]);
     expect(started).toEqual([1, 2]);               // 2nd runs only after 1st settles
     expect(sendMessage).toHaveBeenCalledTimes(1);  // no second apology
+  });
+
+  it('(h) LOO-19: a turn that heartbeats forever is STILL bounded by total (heartbeat refreshes idle, never total)', async () => {
+    // LOO-19 test (c): the model-wait heartbeat now beats while the SDK iterator is
+    // pending — including a genuine iterator deadlock, which we cannot tell apart
+    // from a healthy model-wait on the local daemon path. So a wedged turn can
+    // heartbeat indefinitely. The safety contract is that the heartbeat refreshes
+    // ONLY the idle beacon (`notifyActivity` → lastEventAt) and NEVER the total
+    // ceiling (measured from turn start). Here the handler beats every 8ms forever;
+    // idle (25ms) must therefore never trip, but total (60ms) must still surface —
+    // proving the heartbeat cannot degrade into "never times out".
+    const router = new SessionRouter(
+      makeConfig({ rateLimit: { maxPerMinute: 100 }, idleTimeoutMs: 25, dispatchTimeoutMs: 60 }),
+      ROBOT_ID,
+    );
+    let release!: () => void;
+    const hang = new Promise<void>((r) => { release = r; });
+    let beating = true;
+    const beat = (result: RouteResult): void => {
+      if (!beating) return;
+      result.notifyActivity?.(); // mimic the 20s liveness heartbeat, but forever
+      setTimeout(() => beat(result), 8);
+    };
+
+    const p = router.routeAndHandle(
+      makeMsg({ message_id: '1', channel_type: ChannelType.DM, from_uid: 'u1' }),
+      (result) => {
+        beat(result);
+        return hang; // never settles on its own → only total can bound it
+      },
+    );
+
+    await new Promise((r) => setTimeout(r, 140)); // well past total (60ms), many heartbeats in
+    // Exactly one apology, and it is the TOTAL notice (not idle) — idle never tripped
+    // because the heartbeat kept refreshing lastEventAt, yet total fired regardless.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sendMessage).mock.calls[0][0]).toMatchObject({
+      content: expect.stringContaining('处理时间过长'), // total copy
+    });
+    expect(vi.mocked(sendMessage).mock.calls[0][0]).not.toMatchObject({
+      content: expect.stringContaining('仍在处理中'), // NOT the idle copy
+    });
+
+    beating = false;
+    release();
+    await p;
+    expect(sendMessage).toHaveBeenCalledTimes(1); // no second apology
   });
 });
 

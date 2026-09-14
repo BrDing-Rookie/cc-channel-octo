@@ -146,10 +146,10 @@ function createPausingStream(
   };
 }
 
-describe("queryAgent liveness heartbeat (LOO-18 item 3: in-flight-tool discriminator)", () => {
+describe("queryAgent liveness heartbeat (LOO-18/LOO-19: alive while the turn is still running)", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("beats during a long quiet gap WHILE a tool is in-flight", async () => {
+  it("beats during a long quiet gap WHILE a tool is in-flight (LOO-18 regression)", async () => {
     // tool_use (in-flight) → 120ms of silence → tool_result. With a 20ms heartbeat
     // the beacon must fire several extra times during the gap on top of the
     // per-message beats, so a long tool run never reads as an idle stall.
@@ -166,14 +166,16 @@ describe("queryAgent liveness heartbeat (LOO-18 item 3: in-flight-tool discrimin
     })) { void _; }
 
     // 3 per-message beats + at least one heartbeat beat across the in-flight gap.
-    // (Contrast the no-tool test below, which gets EXACTLY its per-message beats.)
     expect(beats).toBeGreaterThan(3);
   });
 
-  it("does NOT beat during a quiet gap when NO tool is in-flight (truly-wedged discriminator)", async () => {
+  it("beats during a model-wait gap when NO tool is in-flight (LOO-19 fix)", async () => {
     // assistant TEXT (no tool) → 120ms of silence → result. No tool is in-flight,
-    // so the heartbeat criterion is FALSE and the beacon must NOT fire during the
-    // gap — leaving the (real) idle watchdog free to judge this quiet a stall.
+    // but the SDK iterator is still PENDING (the `result` message has not arrived) —
+    // i.e. the turn is healthily waiting on the model. Under LOO-19 that silence
+    // must beat (`streamActive`) so the idle watchdog no longer misreads the most
+    // common healthy silence as a stall. (Pre-LOO-19 this got exactly 2 beats and
+    // produced the false idle timeout this issue fixes.)
     mockQuery.mockReturnValue(createPausingStream([
       { type: "assistant", message: { content: [{ type: "text", text: "thinking done" }] } },
       { type: "result", subtype: "success" },
@@ -185,14 +187,16 @@ describe("queryAgent liveness heartbeat (LOO-18 item 3: in-flight-tool discrimin
       heartbeatIntervalMs: 20,
     })) { void _; }
 
-    // Exactly the 2 per-message beats — the 120ms gap added none (no in-flight tool).
-    expect(beats).toBe(2);
+    // 2 per-message beats + heartbeat beats across the model-wait gap.
+    expect(beats).toBeGreaterThan(2);
   });
 
-  it("stops beating once the tool's result arrives (in-flight set drains)", async () => {
-    // tool_use → tool_result (tool done) → 120ms quiet settle → result. After the
-    // result arrives the in-flight set is empty, so the post-tool quiet adds no
-    // heartbeats — only the 3 per-message beats.
+  it("keeps beating during the model-wait gap AFTER a tool result (LOO-19 fix)", async () => {
+    // tool_use → tool_result (tool done) → 120ms quiet → result. After the tool
+    // result the in-flight set is empty, but the iterator is still pending (waiting
+    // on the model for the final result). Pre-LOO-19 this quiet added no beats (the
+    // in-flight-only criterion); under LOO-19 it beats via `streamActive`, because
+    // the turn is still running.
     mockQuery.mockReturnValue(createPausingStream([
       { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } },
       { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: false }] } },
@@ -205,6 +209,30 @@ describe("queryAgent liveness heartbeat (LOO-18 item 3: in-flight-tool discrimin
       heartbeatIntervalMs: 20,
     })) { void _; }
 
-    expect(beats).toBe(3);
+    expect(beats).toBeGreaterThan(3);
+  });
+
+  it("stops beating once the SDK stream fully settles (no beat past the last message)", async () => {
+    // No gaps: the stream drains straight through. Once the iterator ends,
+    // `streamActive` flips false and the heartbeat is cleared in the finally, so a
+    // subsequent quiet window (waited here, outside the SDK stream — the router's
+    // settle path) adds NO beats. This proves the beat can't outlive the turn and
+    // degrade into "never times out"; the (post-settle) idle/total watchdogs then
+    // judge the rest.
+    mockQuery.mockReturnValue(createMockStream([
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }] } },
+      { type: "result", subtype: "success" },
+    ]));
+
+    let beats = 0;
+    for await (const _ of queryAgent("hi", makeConfig(), undefined, undefined, {
+      onActivity: () => { beats++; },
+      heartbeatIntervalMs: 20,
+    })) { void _; }
+    const afterStream = beats;
+    // Quiet window after the stream has fully settled — no more beats expected.
+    await new Promise((r) => setTimeout(r, 80));
+    expect(beats).toBe(afterStream);
+    expect(beats).toBe(2); // exactly the 2 per-message beats
   });
 });
