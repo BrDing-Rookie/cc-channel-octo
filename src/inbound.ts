@@ -21,7 +21,7 @@ import type { MessagePayload, ForwardMessage, ForwardUser } from './octo/types.j
 import { MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from './octo/types.js';
 import { truncateUtf8ByBytes } from './file-inline-wrap.js';
 import { assertPublicUrl, fetchWithRedirectGuard } from './url-policy.js';
-import { sanitizeDisplayName, sanitizePromptBody } from './prompt-safety.js';
+import { sanitizeDisplayName, sanitizeFileName, sanitizePromptBody } from './prompt-safety.js';
 
 /**
  * S1 helper: same-host check for credential scoping.
@@ -213,6 +213,24 @@ export function buildMediaUrl(relUrl?: string, apiUrl?: string, cdnHost?: string
   }
 
   return candidate;
+}
+
+/**
+ * Resolve a File payload URL and require its canonical path to remain inside
+ * Octo's file-download namespace. Unlike generic media URLs, File URLs can be
+ * fetched with Bot Authorization, so an allowed host alone is insufficient.
+ */
+export function buildFileMediaUrl(relUrl?: string, apiUrl?: string, cdnHost?: string): string | undefined {
+  const url = buildMediaUrl(relUrl, apiUrl, cdnHost);
+  if (!url) return undefined;
+  try {
+    const pathname = new URL(url).pathname;
+    if (!pathname.startsWith('/file/')) return undefined;
+    if (/%(?:2f|5c)/i.test(pathname)) return undefined;
+    return url;
+  } catch {
+    return undefined;
+  }
 }
 
 // ─── RichText (type=14) expansion ─────────────────────────────────────────
@@ -463,11 +481,11 @@ export function resolveContent(payload: MessagePayload | undefined, apiUrl?: str
     }
 
     case MessageType.File: {
-      const url = buildMediaUrl(payload.url, apiUrl, cdnHost);
+      const url = buildFileMediaUrl(payload.url, apiUrl, cdnHost);
       // SECURITY: payload.name is user-controlled; sanitize before it enters the
       // `[文件: …]` label so it can't forge a marker/role label (prompt injection).
       const fileName = typeof payload.name === 'string'
-        ? sanitizeDisplayName(payload.name, '未知文件')
+        ? sanitizeFileName(payload.name, '未知文件')
         : '未知文件';
       return {
         text: url ? `[文件: ${fileName}]\n${url}` : `[文件: ${fileName}]`,
@@ -533,7 +551,7 @@ export function resolveHistoricalMessagePlaceholder(type?: number, name?: string
     case MessageType.GIF: return '[GIF]';
     case MessageType.Voice: return '[语音消息]';
     case MessageType.Video: return '[视频]';
-    case MessageType.File: return `[文件: ${name ? sanitizeDisplayName(name, '未知文件') : '未知文件'}]`;
+    case MessageType.File: return `[文件: ${name ? sanitizeFileName(name, '未知文件') : '未知文件'}]`;
     case MessageType.Location: return '[位置信息]';
     case MessageType.Card: return '[名片]';
     case MessageType.MultipleForward: return '[合并转发]';
@@ -597,26 +615,27 @@ export async function tryResolveFile(params: {
   | { description: string }
 > {
   const { url, botToken, apiUrl, filename, knownSize } = params;
-  const ext = extractExtension(url, filename);
+  const safeFilename = sanitizeFileName(filename, '未知文件');
+  const ext = extractExtension(url, safeFilename);
   if (!TEXT_FILE_EXTENSIONS.has(ext)) {
     // Non-text — surface size info if known
     return {
       description: knownSize != null
-        ? `[文件: ${filename} (${formatBytes(knownSize)})]`
-        : `[文件: ${filename}]`,
+        ? `[文件: ${safeFilename} (${formatBytes(knownSize)})]`
+        : `[文件: ${safeFilename}]`,
     };
   }
 
   // Skip download if known to exceed hard cap
   if (knownSize != null && knownSize > MAX_FILE_DOWNLOAD_BYTES) {
-    return { description: `[文件: ${filename} (${formatBytes(knownSize)}) - 超过下载上限 ${formatBytes(MAX_FILE_DOWNLOAD_BYTES)}]` };
+    return { description: `[文件: ${safeFilename} (${formatBytes(knownSize)}) - 超过下载上限 ${formatBytes(MAX_FILE_DOWNLOAD_BYTES)}]` };
   }
 
   // S1: SSRF defense — reject private/loopback/link-local addresses.
   try {
     await assertPublicUrl(url);
   } catch (err) {
-    return { description: `[文件: ${filename} - 拒绝下载: ${String(err)}]` };
+    return { description: `[文件: ${safeFilename} - 拒绝下载: ${String(err)}]` };
   }
 
   // S1 (re-review fix): scope Authorization PER HOP, not statically.
@@ -634,17 +653,17 @@ export async function tryResolveFile(params: {
   try {
     const resp = await fetchWithRedirectGuard(url, (currentUrl) => {
       const headers: Record<string, string> = {};
-      if (isSameHost(currentUrl, apiUrl)) {
+      if (isSameHost(currentUrl, apiUrl) && buildFileMediaUrl(currentUrl, apiUrl)) {
         headers.Authorization = `Bearer ${botToken}`;
       }
       return { headers, signal };
     });
     if (!resp.ok) {
-      return { description: `[文件: ${filename} - 下载失败 HTTP ${resp.status}]` };
+      return { description: `[文件: ${safeFilename} - 下载失败 HTTP ${resp.status}]` };
     }
     const body = resp.body;
     if (!body) {
-      return { description: `[文件: ${filename} - 响应无内容]` };
+      return { description: `[文件: ${safeFilename} - 响应无内容]` };
     }
 
     // Inline path: read up to INLINE_FILE_MAX_BYTES, fall through to temp on overflow
@@ -663,7 +682,7 @@ export async function tryResolveFile(params: {
         inlineChunks.push(value);
         if (inlineBytes > MAX_FILE_DOWNLOAD_BYTES) {
           try { reader.cancel(); } catch { /* ignore */ }
-          return { description: `[文件: ${filename} (${formatBytes(inlineBytes)}) - 超过下载上限]` };
+          return { description: `[文件: ${safeFilename} (${formatBytes(inlineBytes)}) - 超过下载上限]` };
         }
         // Drain rest into chunks for temp write
         break;
@@ -680,7 +699,7 @@ export async function tryResolveFile(params: {
     // Drain remaining body into the temp file
     await mkdir(TEMP_DIR, { recursive: true });
     cleanupOldTempFiles().catch(() => {});
-    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
+    const safeName = safeFilename.replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
     const tempPath = join(TEMP_DIR, `${randomUUID()}-${safeName}`);
     const ws = createWriteStream(tempPath);
     try {
@@ -696,7 +715,7 @@ export async function tryResolveFile(params: {
           try { reader.cancel(); } catch { /* ignore */ }
           ws.destroy();
           await unlink(tempPath).catch(() => {});
-          return { description: `[文件: ${filename} (${formatBytes(totalBytes)}) - 超过下载上限]` };
+          return { description: `[文件: ${safeFilename} (${formatBytes(totalBytes)}) - 超过下载上限]` };
         }
         if (!ws.write(value)) await new Promise<void>((r) => ws.once('drain', r));
       }
@@ -706,14 +725,14 @@ export async function tryResolveFile(params: {
         ws.on('error', reject);
       });
       const sizeInfo = statSync(tempPath).size;
-      return { tempPath, ...({ description: `[文件: ${filename} (${formatBytes(sizeInfo)}) - 已下载到 ${tempPath}]` } as { description?: string }) };
+      return { tempPath, ...({ description: `[文件: ${safeFilename} (${formatBytes(sizeInfo)}) - 已下载到 ${tempPath}]` } as { description?: string }) };
     } catch (err) {
       ws.destroy();
       await unlink(tempPath).catch(() => {});
-      return { description: `[文件: ${filename} - 下载错误: ${String(err)}]` };
+      return { description: `[文件: ${safeFilename} - 下载错误: ${String(err)}]` };
     }
   } catch (err) {
-    return { description: `[文件: ${filename} - ${String(err).includes('TimeoutError') ? '下载超时' : '网络错误'}]` };
+    return { description: `[文件: ${safeFilename} - ${String(err).includes('TimeoutError') ? '下载超时' : '网络错误'}]` };
   }
 }
 

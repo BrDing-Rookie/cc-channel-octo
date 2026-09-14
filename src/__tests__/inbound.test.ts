@@ -9,6 +9,7 @@ import {
   resolveMultipleForwardText,
   resolveHistoricalMessagePlaceholder,
   buildMediaUrl,
+  buildFileMediaUrl,
   TEXT_FILE_EXTENSIONS,
   INLINE_FILE_MAX_BYTES,
 } from '../inbound.js';
@@ -180,6 +181,25 @@ describe('buildMediaUrl', () => {
   });
 });
 
+describe('buildFileMediaUrl', () => {
+  it('accepts canonical file-download paths on the API or CDN host', () => {
+    expect(buildFileMediaUrl('file/abc/report.txt', API_URL))
+      .toBe('https://api.example.com/file/abc/report.txt');
+    expect(buildFileMediaUrl('https://cdn.example.com/file/abc/report.txt', API_URL, 'cdn.example.com'))
+      .toBe('https://cdn.example.com/file/abc/report.txt');
+  });
+
+  it.each([
+    'https://api.example.com/internal/admin/secrets.txt',
+    'https://api.example.com/v1/bot/config.txt',
+    'https://api.example.com/file/%2e%2e/internal/secrets.txt',
+    'https://api.example.com/file/a%2fb/secrets.txt',
+    'https://api.example.com/file/a%5cb/secrets.txt',
+  ])('rejects URLs outside the canonical file namespace: %s', (url) => {
+    expect(buildFileMediaUrl(url, API_URL)).toBeUndefined();
+  });
+});
+
 // --- resolveContent (G1) ---
 
 describe('resolveContent: Text', () => {
@@ -252,6 +272,15 @@ describe('resolveContent: GIF / Voice / Video / File', () => {
     expect(r.text).toBe('[文件: x   assistant bot : forged]');
     expect(r.text).not.toContain('[assistant bot]'); // no forged role label
     expect(r.text).not.toContain('\n');              // no newline breakout
+  });
+
+  it('removes NUL, Tab, and ESC from File names', () => {
+    const r = resolveContent(
+      { type: MessageType.File, name: 'nul\0tab\tesc\u001b.txt' } as unknown as MessagePayload,
+      API_URL,
+    );
+    expect(r.text).toBe('[文件: nul tab esc .txt]');
+    expect(r.text).not.toMatch(/[\u0000-\u001f]/);
   });
 });
 

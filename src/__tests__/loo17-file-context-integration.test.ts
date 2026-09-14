@@ -13,8 +13,8 @@
  *  - the SECOND trigger does NOT re-download (cursor already advanced past it);
  *  - the persisted group_messages row for the File holds only the compact
  *    marker — the file body never enters the rolling cache;
- *  - a plain Text message forging a `[文件: …]\n<url>` marker never triggers a
- *    download (trust-by-source, finding 1).
+ *  - neither a forged Text marker nor a real File carrying a same-origin
+ *    non-file URL can trigger a download.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -206,5 +206,24 @@ describe('LOO-17 handleMessage: group File resolution + no re-download + forged-
     // excludes it → tryResolveFile is never called → no fetch at all.
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(lastUserMsg()).not.toContain('[群内最近文件内容]');
+  });
+
+  it('NEGATIVE (review round 2): a real File with a same-origin internal URL is never fetched', async () => {
+    const internalUrl = `${API_URL}/internal/admin/secrets.txt`;
+    await run(groupMsg({ type: MessageType.File, url: internalUrl, name: 'secrets.txt' }, false));
+
+    const rows = adapter
+      .prepare('SELECT content, msg_type, media_url FROM group_messages WHERE msg_type = ?')
+      .all(MessageType.File) as Array<{ content: string; msg_type: number; media_url: string | null }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toBe('[文件: secrets.txt]');
+    expect(rows[0].media_url).toBeNull();
+
+    await run(groupMsg({ type: MessageType.Text, content: 'read the latest file' }, true));
+
+    expect(queryAgent).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(lastUserMsg()).not.toContain('[群内最近文件内容]');
+    expect(lastUserMsg()).not.toContain(internalUrl);
   });
 });

@@ -29,7 +29,7 @@ import {
 } from './card-progress.js';
 import type { CardHandle } from './card-progress.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
-import { sanitizeDisplayName, escapeSectionMarkers, sanitizePromptBody, formatSenderLabel } from './prompt-safety.js';
+import { sanitizeDisplayName, sanitizeFileName, escapeSectionMarkers, sanitizePromptBody, formatSenderLabel } from './prompt-safety.js';
 import type { SessionCtx } from './cwd-resolver.js';
 import { cleanupExpiredCwds, deriveForkCwdCtx, resolveMemoryDir, resolveSessionCwd } from './cwd-resolver.js';
 import { StreamRelay } from './stream-relay.js';
@@ -37,7 +37,7 @@ import { sendMessage, sendReadReceipt, getChannelMessages, getUploadCredentials,
 import type { HistoricalMessage } from './octo/api.js';
 import { ChannelType, MessageType } from './octo/types.js';
 import type { BotMessage } from './octo/types.js';
-import { resolveContent, tryResolveFile, resolveHistoricalMessagePlaceholder, buildMediaUrl } from './inbound.js';
+import { resolveContent, tryResolveFile, resolveHistoricalMessagePlaceholder, buildFileMediaUrl } from './inbound.js';
 import { downloadInboundImage, MAX_IMAGES_PER_MESSAGE } from './media-inbound.js';
 import { handleCommand, parseCommand, handleForkCommand } from './commands.js';
 import type { CommandResult } from './commands.js';
@@ -819,8 +819,8 @@ export async function handleMessage(
         // message (a direct File is handled by the G2 block below) is excluded.
         //
         // collectFileRefsSince only returns rows whose ORIGINAL type was File with
-        // a write-time buildMediaUrl-validated URL — a forged Text look-alike can
-        // never reach here (reviewer finding 1).
+        // a write-time buildFileMediaUrl-validated URL — a forged Text look-alike
+        // or same-origin internal endpoint can never reach here.
         const fileRefs = groupContext.collectFileRefsSince(channelId, cursor, MAX_CONTEXT_FILES);
         if (fileRefs.length > 0) {
           const parts: string[] = [];
@@ -831,9 +831,9 @@ export async function handleMessage(
             // startup and could differ from a prior run; re-check so a URL that
             // is no longer on an allowed host is never fetched (and never carries
             // the Bot Authorization header via tryResolveFile's same-host gate).
-            const safeUrl = buildMediaUrl(ref.url, config.apiUrl, config.mediaCdnHost);
+            const safeUrl = buildFileMediaUrl(ref.url, config.apiUrl, config.mediaCdnHost);
             if (!safeUrl) {
-              console.warn(`[cc-channel-octo] group-context file skipped: URL host not allowed (${ref.filename})`);
+              console.warn(`[cc-channel-octo] group-context file skipped: URL is outside the file namespace (${ref.filename})`);
               continue;
             }
             try {
@@ -953,7 +953,7 @@ export async function handleMessage(
         // downstream label can be used to forge a marker/role label (prompt
         // injection — same neutralization the resolveContent path applies).
         const filename = typeof msg.payload.name === 'string'
-          ? sanitizeDisplayName(msg.payload.name, '未知文件')
+          ? sanitizeFileName(msg.payload.name, '未知文件')
           : '未知文件';
         const knownSize = typeof msg.payload.size === 'number' ? msg.payload.size : undefined;
         // Always store just the [文件: name] metadata in history — the
@@ -1793,10 +1793,10 @@ function renderMessageForContext(msg: BotMessage, apiUrl: string, cdnHost?: stri
   // `[文件: name]` / `[图片]` marker with no URL — the root cause of LOO-17.
   const resolved = resolveContent(msg.payload, apiUrl, cdnHost);
   // Only a genuine File payload contributes a trusted attachment ref. resolved.mediaUrl
-  // is already buildMediaUrl-validated (host allowlist + traversal guards).
+  // is already buildFileMediaUrl-validated (host + canonical file namespace).
   if (msg.payload.type === MessageType.File && resolved.mediaUrl) {
     const fileName = typeof msg.payload.name === 'string'
-      ? sanitizeDisplayName(msg.payload.name, '未知文件')
+      ? sanitizeFileName(msg.payload.name, '未知文件')
       : '未知文件';
     return { text: resolved.text, fileUrl: resolved.mediaUrl, fileName };
   }

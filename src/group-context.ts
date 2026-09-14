@@ -5,7 +5,7 @@
 import type { DbAdapter, PreparedStatement } from './db-adapter.js';
 import { getGroupMembers, fetchUserInfo } from './octo/api.js';
 import { extractParentGroupNo } from './octo/channel-id.js';
-import { sanitizeDisplayName, formatSenderLabel } from './prompt-safety.js';
+import { sanitizeDisplayName, sanitizeFileName, formatSenderLabel } from './prompt-safety.js';
 import { MessageType } from './octo/types.js';
 
 interface GroupMessage {
@@ -216,7 +216,7 @@ export class GroupContext {
     content: string,
     timestamp: number,
     // LOO-17: provenance for a trusted attachment. `msgType` is the ORIGINAL
-    // MessageType; `mediaUrl` is the buildMediaUrl-VALIDATED download URL and
+    // MessageType; `mediaUrl` is the buildFileMediaUrl-VALIDATED download URL and
     // `fileName` the sender-provided name — both set ONLY for a real
     // MessageType.File by the caller. They let collectFileRefsSince trust by
     // source instead of parsing the forgeable display string.
@@ -594,7 +594,7 @@ export class GroupContext {
       refs.push({
         fromName: formatSenderLabel(r.from_uid, displayName),
         // Re-sanitize the decoded filename (don't trust encode-side sanitization).
-        filename: sanitizeDisplayName(r.file_name ?? '', '未知文件'),
+        filename: sanitizeFileName(r.file_name ?? '', '未知文件'),
         url: r.media_url,
       });
       if (refs.length >= maxFiles) break;
